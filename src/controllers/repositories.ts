@@ -20,6 +20,11 @@ async function getActiveRelease(db: any) {
 
 // Live fetch from GitLab
 repos.get('/repositories', async (c) => {
+  if (!c.env.GITLAB_TOKEN) {
+    console.error('Environment Error: GITLAB_TOKEN is missing')
+    return c.json({ error: 'System configuration error: GITLAB_TOKEN missing' }, 500)
+  }
+
   const cached = await c.env.KV.get('gitlab:projects')
   if (cached) return c.json(JSON.parse(cached))
 
