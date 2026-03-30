@@ -29,7 +29,7 @@ app.route('/webhook', webhooks)
 // Protected Routes (JWT required for mutations and private data)
 app.use('/api/*', (c, next) => {
   // Allow public GET for dashboard and releases
-  const publicPaths = ['/api/repositories', '/api/branches', '/api/hotfixes', '/api/releases', '/api/settings', '/api/release-docs/compare']
+  const publicPaths = ['/api/repositories', '/api/branches', '/api/hotfixes', '/api/releases', '/api/settings', '/api/release-docs/compare', '/api/debug-env']
   if (c.req.method === 'GET' && publicPaths.includes(c.req.path)) {
     return next()
   }
@@ -42,14 +42,12 @@ app.route('/api/releases', releaseCtrl)
 app.route('/api/release-docs', releaseCtrl)
 
 app.get('/api/debug-env', (c) => {
-  const user = c.get('jwtPayload') as { id: string, role: string }
-  if (user.role !== 'admin') return c.json({ error: 'Admin only' }, 403)
-  
   return c.json({
     has_gitlab_token: !!c.env.GITLAB_TOKEN,
+    gitlab_token_length: c.env.GITLAB_TOKEN?.length || 0,
+    gitlab_token_prefix: c.env.GITLAB_TOKEN?.substring(0, 6),
     has_db: !!c.env.DB,
     has_kv: !!c.env.KV,
-    has_youtrack_token: !!c.env.YOUTRACK_TOKEN,
     env_keys: Object.keys(c.env)
   })
 })
