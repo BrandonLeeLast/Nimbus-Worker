@@ -28,7 +28,7 @@ auth.post('/login', async (c) => {
 })
 
 auth.post('/reset-password', async (c) => {
-  const payload = c.get('jwtPayload')
+  const payload = c.get('jwtPayload') as any
   const { newPassword } = await c.req.json()
   const db = drizzle(c.env.DB)
   
@@ -41,7 +41,7 @@ auth.post('/reset-password', async (c) => {
 })
 
 auth.post('/invite', async (c) => {
-  const admin = c.get('jwtPayload')
+  const admin = c.get('jwtPayload') as any
   if (admin.role !== 'admin') return c.json({ error: 'Forbidden' }, 403)
 
   const { email, role } = await c.req.json()

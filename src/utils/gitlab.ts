@@ -9,7 +9,7 @@ export const fetchGitLab = async (path: string, token: string, method = 'GET', b
   }
   const res = await fetch(`https://gitlab.com/api/v4${path}`, options);
   if (!res.ok) {
-    const error = await res.json().catch(() => ({ message: res.statusText }));
+    const error = await res.json().catch(() => ({ message: res.statusText })) as any
     throw new Error(error.message || `GitLab API error: ${res.status}`);
   }
   return res.json();
