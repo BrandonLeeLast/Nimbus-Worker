@@ -6,6 +6,7 @@ import { checkBranchExists } from '../utils/gitlab'
 
 type Bindings = {
   DB: D1Database
+  KV: KVNamespace
   GITLAB_TOKEN: string
 }
 
@@ -19,6 +20,9 @@ async function getActiveRelease(db: any) {
 
 // Live fetch from GitLab
 repos.get('/repositories', async (c) => {
+  const cached = await c.env.KV.get('gitlab:projects')
+  if (cached) return c.json(JSON.parse(cached))
+
   try {
     const response = await fetch('https://gitlab.com/api/v4/projects?membership=true&simple=true&per_page=100', {
       headers: { 'Authorization': `Bearer ${c.env.GITLAB_TOKEN}` }
@@ -26,13 +30,16 @@ repos.get('/repositories', async (c) => {
     if (!response.ok) throw new Error(`GitLab API error: ${response.statusText}`)
     
     const projects = await response.json() as any[]
-    return c.json(projects.map(p => ({
+    const results = projects.map(p => ({
       id: String(p.id),
       name: p.name_with_namespace,
       url: p.web_url,
       provider: 'gitlab',
       remote_id: String(p.id)
-    })))
+    }))
+
+    await c.env.KV.put('gitlab:projects', JSON.stringify(results), { expirationTtl: 3600 })
+    return c.json(results)
   } catch (e: any) {
     return c.json({ error: e.message }, 500)
   }
@@ -42,6 +49,10 @@ repos.get('/branches', async (c) => {
   const db = drizzle(c.env.DB)
   const activeRelease = await getActiveRelease(db)
   if (!activeRelease) return c.json([])
+
+  const cacheKey = `gitlab:branches:${activeRelease}`
+  const cached = await c.env.KV.get(cacheKey)
+  if (cached) return c.json(JSON.parse(cached))
 
   try {
       const projectsRes = await fetch('https://gitlab.com/api/v4/projects?membership=true&simple=true&per_page=50', {
@@ -55,6 +66,7 @@ repos.get('/branches', async (c) => {
       })
       
       const results = (await Promise.all(branchPromises)).filter(Boolean)
+      await c.env.KV.put(cacheKey, JSON.stringify(results), { expirationTtl: 300 })
       return c.json(results)
   } catch (e: any) {
       return c.json({ error: e.message }, 500)
@@ -65,6 +77,10 @@ repos.get('/hotfixes', async (c) => {
   const db = drizzle(c.env.DB)
   const activeRelease = await getActiveRelease(db)
   
+  const cacheKey = `gitlab:hotfixes:${activeRelease || 'any'}`
+  const cached = await c.env.KV.get(cacheKey)
+  if (cached) return c.json(JSON.parse(cached))
+
   try {
     // Fetch merged MRs related to the active release (matching title or labels)
     const searchQuery = activeRelease ? `hotfix ${activeRelease}` : 'hotfix'
@@ -74,13 +90,16 @@ repos.get('/hotfixes', async (c) => {
     if (!response.ok) throw new Error(`GitLab API error: ${response.statusText}`)
     
     const mrs = await response.json() as any[]
-    return c.json(mrs.map(mr => ({
+    const results = mrs.map(mr => ({
       id: String(mr.id),
       ticket_id: mr.title.match(/INDEV-\d+|OPENBET-\d+/i)?.[0] || 'N/A',
       ticket_summary: mr.title,
       author: mr.author.name,
       merged_at: mr.merged_at
-    })))
+    }))
+
+    await c.env.KV.put(cacheKey, JSON.stringify(results), { expirationTtl: 300 })
+    return c.json(results)
   } catch (e: any) {
     return c.json({ error: e.message }, 500)
   }

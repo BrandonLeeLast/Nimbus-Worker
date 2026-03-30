@@ -29,7 +29,7 @@ app.route('/webhook', webhooks)
 // Protected Routes (JWT required for mutations and private data)
 app.use('/api/*', (c, next) => {
   // Allow public GET for dashboard and releases
-  const publicPaths = ['/api/repositories', '/api/branches', '/api/hotfixes', '/api/releases', '/api/release-docs/compare']
+  const publicPaths = ['/api/repositories', '/api/branches', '/api/hotfixes', '/api/releases', '/api/settings', '/api/release-docs/compare']
   if (c.req.method === 'GET' && publicPaths.includes(c.req.path)) {
     return next()
   }
