@@ -5,6 +5,7 @@ import auth from './controllers/auth'
 import repos from './controllers/repositories'
 import releaseCtrl from './controllers/releases'
 import webhooks from './controllers/webhooks'
+import { fetchGitLab } from './utils/gitlab'
 
 type Bindings = {
   DB: D1Database
@@ -54,8 +55,8 @@ app.get('/api/debug-env', (c) => {
 
 app.get('/api/debug-gitlab', async (c) => {
   try {
-    const data = await fetchGitLab('/user', c.env.GITLAB_TOKEN)
-    return c.json({ success: true, username: data?.[0]?.username || data?.username || 'found' })
+    const data = await fetchGitLab('/user', c.env.GITLAB_TOKEN) as any
+    return c.json({ success: true, username: (Array.isArray(data) ? data[0]?.username : data?.username) || 'found' })
   } catch (e: any) {
     return c.json({ success: false, error: e.message })
   }
