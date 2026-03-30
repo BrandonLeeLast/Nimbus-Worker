@@ -29,7 +29,7 @@ app.route('/webhook', webhooks)
 // Protected Routes (JWT required for mutations and private data)
 app.use('/api/*', (c, next) => {
   // Allow public GET for dashboard and releases
-  const publicPaths = ['/api/repositories', '/api/branches', '/api/hotfixes', '/api/releases', '/api/settings', '/api/release-docs/compare', '/api/debug-env']
+  const publicPaths = ['/api/repositories', '/api/branches', '/api/hotfixes', '/api/releases', '/api/settings', '/api/release-docs/compare', '/api/debug-env', '/api/debug-gitlab']
   if (c.req.method === 'GET' && publicPaths.includes(c.req.path)) {
     return next()
   }
@@ -50,6 +50,15 @@ app.get('/api/debug-env', (c) => {
     has_kv: !!c.env.KV,
     env_keys: Object.keys(c.env)
   })
+})
+
+app.get('/api/debug-gitlab', async (c) => {
+  try {
+    const data = await fetchGitLab('/user', c.env.GITLAB_TOKEN)
+    return c.json({ success: true, username: data?.[0]?.username || data?.username || 'found' })
+  } catch (e: any) {
+    return c.json({ success: false, error: e.message })
+  }
 })
 
 // Global Error Handler
