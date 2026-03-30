@@ -18,7 +18,7 @@ const releaseCtrl = new Hono<{ Bindings: Bindings }>()
 // Helper to get projects from GitLab
 async function getLiveRepos(token: string) {
   const response = await fetch('https://gitlab.com/api/v4/projects?membership=true&simple=true&per_page=100', {
-    headers: { 'Authorization': `Bearer ${token}` }
+    headers: { 'PRIVATE-TOKEN': token }
   })
   if (!response.ok) throw new Error(`GitLab API error: ${response.statusText}`)
   return await response.json() as any[]

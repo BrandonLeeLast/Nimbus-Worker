@@ -25,7 +25,7 @@ repos.get('/repositories', async (c) => {
 
   try {
     const response = await fetch('https://gitlab.com/api/v4/projects?membership=true&simple=true&per_page=100', {
-      headers: { 'Authorization': `Bearer ${c.env.GITLAB_TOKEN}` }
+      headers: { 'PRIVATE-TOKEN': c.env.GITLAB_TOKEN }
     })
     if (!response.ok) throw new Error(`GitLab API error: ${response.statusText}`)
     
@@ -56,7 +56,7 @@ repos.get('/branches', async (c) => {
 
   try {
       const projectsRes = await fetch('https://gitlab.com/api/v4/projects?membership=true&simple=true&per_page=50', {
-        headers: { 'Authorization': `Bearer ${c.env.GITLAB_TOKEN}` }
+        headers: { 'PRIVATE-TOKEN': c.env.GITLAB_TOKEN }
       })
       const projects = await projectsRes.json() as any[]
       
@@ -85,7 +85,7 @@ repos.get('/hotfixes', async (c) => {
     // Fetch merged MRs related to the active release (matching title or labels)
     const searchQuery = activeRelease ? `hotfix ${activeRelease}` : 'hotfix'
     const response = await fetch(`https://gitlab.com/api/v4/merge_requests?state=merged&scope=all&search=${searchQuery}&per_page=20`, {
-      headers: { 'Authorization': `Bearer ${c.env.GITLAB_TOKEN}` }
+      headers: { 'PRIVATE-TOKEN': c.env.GITLAB_TOKEN }
     })
     if (!response.ok) throw new Error(`GitLab API error: ${response.statusText}`)
     
