@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import { drizzle } from 'drizzle-orm/d1'
 import { eq } from 'drizzle-orm'
 import { systemSettings } from '../db/schema'
-import { checkBranchExists } from '../utils/gitlab'
+import { checkBranchExists, fetchGitLab } from '../utils/gitlab'
 
 type Bindings = {
   DB: D1Database
@@ -20,21 +20,11 @@ async function getActiveRelease(db: any) {
 
 // Live fetch from GitLab
 repos.get('/repositories', async (c) => {
-  if (!c.env.GITLAB_TOKEN) {
-    console.error('Environment Error: GITLAB_TOKEN is missing')
-    return c.json({ error: 'System configuration error: GITLAB_TOKEN missing' }, 500)
-  }
-
   const cached = await c.env.KV.get('gitlab:projects')
   if (cached) return c.json(JSON.parse(cached))
 
   try {
-    const response = await fetch('https://gitlab.com/api/v4/projects?membership=true&simple=true&per_page=100', {
-      headers: { 'PRIVATE-TOKEN': c.env.GITLAB_TOKEN }
-    })
-    if (!response.ok) throw new Error(`GitLab API error: ${response.statusText}`)
-    
-    const projects = await response.json() as any[]
+    const projects = await fetchGitLab('/projects?membership=true&simple=true&per_page=100', c.env.GITLAB_TOKEN) as any[]
     const results = projects.map(p => ({
       id: String(p.id),
       name: p.name_with_namespace,
@@ -60,10 +50,7 @@ repos.get('/branches', async (c) => {
   if (cached) return c.json(JSON.parse(cached))
 
   try {
-      const projectsRes = await fetch('https://gitlab.com/api/v4/projects?membership=true&simple=true&per_page=50', {
-        headers: { 'PRIVATE-TOKEN': c.env.GITLAB_TOKEN }
-      })
-      const projects = await projectsRes.json() as any[]
+      const projects = await fetchGitLab('/projects?membership=true&simple=true&per_page=50', c.env.GITLAB_TOKEN) as any[]
       
       const branchPromises = projects.map(async (p) => {
         const exists = await checkBranchExists(String(p.id), activeRelease, c.env.GITLAB_TOKEN)
@@ -89,12 +76,8 @@ repos.get('/hotfixes', async (c) => {
   try {
     // Fetch merged MRs related to the active release (matching title or labels)
     const searchQuery = activeRelease ? `hotfix ${activeRelease}` : 'hotfix'
-    const response = await fetch(`https://gitlab.com/api/v4/merge_requests?state=merged&scope=all&search=${searchQuery}&per_page=20`, {
-      headers: { 'PRIVATE-TOKEN': c.env.GITLAB_TOKEN }
-    })
-    if (!response.ok) throw new Error(`GitLab API error: ${response.statusText}`)
+    const mrs = await fetchGitLab(`/merge_requests?state=merged&scope=all&search=${searchQuery}&per_page=20`, c.env.GITLAB_TOKEN) as any[]
     
-    const mrs = await response.json() as any[]
     const results = mrs.map(mr => ({
       id: String(mr.id),
       ticket_id: mr.title.match(/INDEV-\d+|OPENBET-\d+/i)?.[0] || 'N/A',
