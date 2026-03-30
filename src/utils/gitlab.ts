@@ -3,25 +3,27 @@ export const fetchGitLab = async (path: string, token: string, method = 'GET', b
     throw new Error('GITLAB_TOKEN is missing from environment');
   }
 
-  // Diagnostic logging (Masked)
-  console.log(`[GitLab] Calling ${path} with token prefix: ${token.substring(0, 6)}...`);
-
   const options: RequestInit = {
     method,
     headers: { 
       'PRIVATE-TOKEN': token.trim(),
-      'Accept': 'application/json'
+      'Accept': 'application/json',
+      'User-Agent': 'Nimbus-Release-Tracker'
     }
   };
   if (body) {
     options.headers = { ...options.headers, 'Content-Type': 'application/json' };
     options.body = JSON.stringify(body);
   }
+
   const res = await fetch(`https://gitlab.com/api/v4${path}`, options);
   if (!res.ok) {
-    const error = await res.json().catch(() => ({ message: res.statusText })) as any;
-    console.error(`[GitLab] Error ${res.status}: ${JSON.stringify(error)}`);
-    throw new Error(error.message || `GitLab API error: ${res.status}`);
+    const errorText = await res.text();
+    let errorJson: any;
+    try { errorJson = JSON.parse(errorText); } catch { errorJson = { message: errorText }; }
+    
+    console.error(`[GitLab] ${method} ${path} failed (${res.status}): ${JSON.stringify(errorJson)}`);
+    throw new Error(errorJson.message || errorJson.error || `GitLab API error: ${res.status}`);
   }
   return res.json();
 };

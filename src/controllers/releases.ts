@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import { drizzle } from 'drizzle-orm/d1'
 import { eq, desc } from 'drizzle-orm'
 import { releases, releaseDocuments, systemSettings } from '../db/schema'
-import { compareBranches, checkBranchExists, createBranch } from '../utils/gitlab'
+import { compareBranches, checkBranchExists, createBranch, fetchGitLab } from '../utils/gitlab'
 import { fetchYouTrack } from '../utils/youtrack'
 import { extractTickets } from '../utils/tickets'
 
@@ -17,11 +17,7 @@ const releaseCtrl = new Hono<{ Bindings: Bindings }>()
 
 // Helper to get projects from GitLab
 async function getLiveRepos(token: string) {
-  const response = await fetch('https://gitlab.com/api/v4/projects?membership=true&simple=true&per_page=100', {
-    headers: { 'PRIVATE-TOKEN': token }
-  })
-  if (!response.ok) throw new Error(`GitLab API error: ${response.statusText}`)
-  return await response.json() as any[]
+  return await fetchGitLab('/projects?membership=true&simple=true&per_page=100', token) as any[]
 }
 
 releaseCtrl.get('/', async (c) => {
