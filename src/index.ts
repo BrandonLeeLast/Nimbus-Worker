@@ -2,9 +2,12 @@ import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import { drizzle } from 'drizzle-orm/d1'
 import { desc, eq } from 'drizzle-orm'
-import { branches, hotfixes, repositories } from './db/schema'
+import { jwt } from 'hono/jwt'
+import { branches, hotfixes, repositories, users, systemSettings } from './db/schema'
+import { hashPassword, verifyPassword } from './utils/auth'
+import { sendInvitationEmail } from './utils/emails'
 
-type Bindings = {
+export type Bindings = {
   DB: D1Database
   KV: KVNamespace
   RESEND_API_KEY: string
@@ -12,11 +15,25 @@ type Bindings = {
   GITHUB_TOKEN: string
   YOUTRACK_TOKEN: string
   YOUTRACK_BASE_URL: string
+  JWT_SECRET: string
+}
+
+export type JWTPayload = {
+  id: string
+  email: string
+  role: string
+  exp: number
 }
 
 const app = new Hono<{ Bindings: Bindings }>()
 
 app.use('*', cors())
+
+// Auth Middleware (Optional for public dashboard, required for management)
+// We only protect management routes
+app.use('/api/auth/invite', (c, next) => jwt({ secret: c.env.JWT_SECRET, alg: 'HS256' })(c, next))
+app.use('/api/repositories/*', (c, next) => jwt({ secret: c.env.JWT_SECRET, alg: 'HS256' })(c, next))
+app.use('/api/settings/*', (c, next) => jwt({ secret: c.env.JWT_SECRET, alg: 'HS256' })(c, next))
 
 // --- Helpers ---
 function parseBranchName(branchName: string) {
@@ -123,6 +140,120 @@ app.get('/api/repositories', async (c) => {
   const db = drizzle(c.env.DB)
   const results = await db.select().from(repositories)
   return c.json(results)
+})
+
+app.post('/api/repositories', async (c) => {
+  const payload = await c.req.json()
+  const db = drizzle(c.env.DB)
+  const id = crypto.randomUUID()
+  await db.insert(repositories).values({
+    id,
+    name: payload.name,
+    url: payload.url,
+    provider: payload.provider || 'gitlab',
+    remote_id: payload.remote_id
+  })
+  return c.json({ success: true, id })
+})
+
+app.delete('/api/repositories/:id', async (c) => {
+  const id = c.req.param('id')
+  const db = drizzle(c.env.DB)
+  await db.delete(repositories).where(eq(repositories.id, id))
+  return c.json({ success: true })
+})
+
+// --- Auth Endpoints ---
+
+app.post('/api/auth/login', async (c) => {
+  const { email, password } = await c.req.json()
+  const db = drizzle(c.env.DB)
+  const [user] = await db.select().from(users).where(eq(users.email, email))
+
+  if (!user || !(await verifyPassword(password, user.password_hash))) {
+    return c.json({ error: 'Invalid credentials' }, 401)
+  }
+
+  const payload: JWTPayload = {
+    id: user.id,
+    email: user.email,
+    role: user.role || 'user',
+    exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 // 24h
+  }
+
+  // Import sign from hono/jwt
+  const { sign } = await import('hono/jwt')
+  const token = await sign(payload, c.env.JWT_SECRET)
+
+  return c.json({ 
+    token, 
+    user: { 
+      email: user.email, 
+      role: user.role, 
+      mustReset: user.must_reset_password === 1 
+    } 
+  })
+})
+
+app.post('/api/auth/invite', async (c) => {
+  const admin = c.get('jwtPayload') as JWTPayload
+  if (admin.role !== 'admin') return c.json({ error: 'Forbidden' }, 403)
+
+  const { email, role } = await c.req.json()
+  const tempPass = Math.random().toString(36).slice(-8)
+  const hash = await hashPassword(tempPass)
+
+  const db = drizzle(c.env.DB)
+  await db.insert(users).values({
+    id: crypto.randomUUID(),
+    email,
+    password_hash: hash,
+    role: role || 'user',
+    must_reset_password: 1,
+    created_at: new Date().toISOString()
+  })
+
+  await sendInvitationEmail(c.env, email, tempPass)
+  return c.json({ success: true })
+})
+
+app.post('/api/auth/reset-password', async (c) => {
+  const payload = await c.req.json()
+  const { newPassword } = payload
+  const user = c.get('jwtPayload') as JWTPayload
+  
+  const hash = await hashPassword(newPassword)
+  const db = drizzle(c.env.DB)
+  
+  await db.update(users)
+    .set({ password_hash: hash, must_reset_password: 0 })
+    .where(eq(users.id, user.id))
+
+  return c.json({ success: true })
+})
+
+// --- Settings Endpoints ---
+
+app.get('/api/settings', async (c) => {
+  const db = drizzle(c.env.DB)
+  const results = await db.select().from(systemSettings)
+  const settingsMap = results.reduce((acc: any, curr: { key: string, value: string | null }) => {
+    acc[curr.key] = curr.value
+    return acc
+  }, {})
+  return c.json(settingsMap)
+})
+
+app.post('/api/settings', async (c) => {
+  const payload = await c.req.json()
+  const db = drizzle(c.env.DB)
+  
+  for (const [key, value] of Object.entries(payload)) {
+    await db.insert(systemSettings)
+      .values({ key, value: String(value) })
+      .onConflictDoUpdate({ target: systemSettings.key, set: { value: String(value) } })
+  }
+  return c.json({ success: true })
 })
 
 // --- Webhooks ---
