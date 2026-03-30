@@ -36,7 +36,7 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: d1 migrations apply DB --env ${{ steps.env_vars.outputs.env_name }} --remote
+          command: d1 migrations apply DB --env ${{ steps.env_vars.outputs.env_name }} --remote --auto-approve
 
       - name: Deploy Backend Worker
         uses: cloudflare/wrangler-action@v3
