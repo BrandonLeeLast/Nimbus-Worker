@@ -26,8 +26,12 @@ app.use('*', cors())
 app.route('/api/auth', auth)
 app.route('/webhook', webhooks)
 
-// Protected Routes (JWT required for all below)
+// Protected Routes (JWT required for mutations and private data)
 app.use('/api/*', (c, next) => {
+  // Allow public GET for dashboard and releases
+  if (c.req.method === 'GET' && (c.req.path === '/api/repositories' || c.req.path === '/api/releases' || c.req.path === '/api/release-docs/compare')) {
+    return next()
+  }
   const jwtMiddleware = jwt({ secret: c.env.JWT_SECRET, alg: 'HS256' })
   return jwtMiddleware(c, next)
 })
