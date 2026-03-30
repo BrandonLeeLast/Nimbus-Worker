@@ -3,7 +3,7 @@ main = "src/index.ts"
 compatibility_date = "2024-03-29"
 
 [observability]
-enabled = false
+enabled = true
 
 # STAGING ENVIRONMENT
 [env.staging]
@@ -22,7 +22,7 @@ id = "74cf280630f749e3aaee3c588c425509"
 crons = ["0 0 * * *"] 
 
 [env.staging.observability]
-enabled = false
+enabled = true
 
 # PRODUCTION ENVIRONMENT
 [env.production]
@@ -41,4 +41,4 @@ id = "14cb432af330454bb33764e4e80a4b87"
 crons = ["0 0 * * *"]
 
 [env.production.observability]
-enabled = false
+enabled = true
