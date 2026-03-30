@@ -5,7 +5,6 @@ compatibility_date = "2024-03-29"
 # STAGING ENVIRONMENT
 [env.staging]
 name = "nimbus-worker-staging"
-route = { pattern = "staging-api.yourdomain.com", custom_domain = true } # Optional: Remove if using default workers.dev URLs
 
 [[env.staging.d1_databases]]
 binding = "DB"
@@ -22,7 +21,6 @@ crons = ["0 0 * * *"]
 # PRODUCTION ENVIRONMENT
 [env.production]
 name = "nimbus-worker-prod"
-route = { pattern = "api.yourdomain.com", custom_domain = true } # Optional: Remove if using default workers.dev URLs
 
 [[env.production.d1_databases]]
 binding = "DB"
