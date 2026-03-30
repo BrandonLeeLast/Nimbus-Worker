@@ -29,14 +29,15 @@ app.route('/webhook', webhooks)
 // Protected Routes (JWT required for mutations and private data)
 app.use('/api/*', (c, next) => {
   // Allow public GET for dashboard and releases
-  if (c.req.method === 'GET' && (c.req.path === '/api/repositories' || c.req.path === '/api/releases' || c.req.path === '/api/release-docs/compare')) {
+  const publicPaths = ['/api/repositories', '/api/branches', '/api/hotfixes', '/api/releases', '/api/release-docs/compare']
+  if (c.req.method === 'GET' && publicPaths.includes(c.req.path)) {
     return next()
   }
   const jwtMiddleware = jwt({ secret: c.env.JWT_SECRET, alg: 'HS256' })
   return jwtMiddleware(c, next)
 })
 
-app.route('/api/repositories', repos)
+app.route('/api', repos)
 app.route('/api/releases', releaseCtrl)
 app.route('/api/release-docs', releaseCtrl)
 

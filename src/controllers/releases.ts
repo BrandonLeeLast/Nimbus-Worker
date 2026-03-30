@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { drizzle } from 'drizzle-orm/d1'
 import { eq, desc } from 'drizzle-orm'
-import { repositories, releases, releaseDocuments, systemSettings } from '../db/schema'
+import { releases, releaseDocuments, systemSettings } from '../db/schema'
 import { compareBranches, checkBranchExists, createBranch } from '../utils/gitlab'
 import { fetchYouTrack } from '../utils/youtrack'
 import { extractTickets } from '../utils/tickets'
@@ -14,6 +14,15 @@ type Bindings = {
 }
 
 const releaseCtrl = new Hono<{ Bindings: Bindings }>()
+
+// Helper to get projects from GitLab
+async function getLiveRepos(token: string) {
+  const response = await fetch('https://gitlab.com/api/v4/projects?membership=true&simple=true&per_page=100', {
+    headers: { 'Authorization': `Bearer ${token}` }
+  })
+  if (!response.ok) throw new Error(`GitLab API error: ${response.statusText}`)
+  return await response.json() as any[]
+}
 
 releaseCtrl.get('/', async (c) => {
   const db = drizzle(c.env.DB)
@@ -29,7 +38,6 @@ releaseCtrl.post('/', async (c) => {
   if (!name) return c.json({ error: 'Release name required' }, 400)
 
   const db = drizzle(c.env.DB)
-  const repos = await db.select().from(repositories)
   const releaseId = crypto.randomUUID()
 
   try {
@@ -45,14 +53,16 @@ releaseCtrl.post('/', async (c) => {
     throw e
   }
 
+  // --- LIVE REPOS FROM GITLAB ---
+  const repos = await getLiveRepos(c.env.GITLAB_TOKEN)
   const results = []
+  
   for (const repo of repos) {
-    if (repo.provider !== 'gitlab' || !repo.remote_id) continue
-    
+    // Attempt creation from 'stage'
     try {
-      const exists = await checkBranchExists(repo.remote_id, name, c.env.GITLAB_TOKEN)
+      const exists = await checkBranchExists(String(repo.id), name, c.env.GITLAB_TOKEN)
       if (!exists) {
-        await createBranch(repo.remote_id, name, 'stage', c.env.GITLAB_TOKEN)
+        await createBranch(String(repo.id), name, 'stage', c.env.GITLAB_TOKEN)
         results.push({ repo: repo.name, status: 'created' })
       } else {
         results.push({ repo: repo.name, status: 'exists' })
@@ -69,32 +79,32 @@ releaseCtrl.get('/compare', async (c) => {
   const from = c.req.query('from') || 'stage'
   const to = c.req.query('to') || 'main'
   const db = drizzle(c.env.DB)
-  const repos = await db.select().from(repositories)
   
   const settings = await db.select().from(systemSettings).where(eq(systemSettings.key, 'EXCLUDED_TICKETS'))
   const excludedLine = settings[0]?.value || ''
   const excludedSet = new Set(excludedLine.split(',').map(t => t.trim().toUpperCase()))
 
   const ticketMap = new Map<string, { summary: string, assignee: string, projects: Set<string> }>()
+  
+  // --- LIVE REPOS FROM GITLAB ---
+  const repos = await getLiveRepos(c.env.GITLAB_TOKEN)
 
   for (const repo of repos) {
-    if (repo.provider === 'gitlab' && repo.remote_id) {
-        try {
-          const comparison = await compareBranches(repo.remote_id, from, to, c.env.GITLAB_TOKEN)
-          for (const commit of (comparison.commits || [])) {
-            const foundTickets = extractTickets(commit.message)
-            for (const ticketId of foundTickets) {
-              if (excludedSet.has(ticketId.toUpperCase())) continue;
-              if (!ticketMap.has(ticketId)) {
-                 ticketMap.set(ticketId, { summary: 'Loading...', assignee: 'Unassigned', projects: new Set() })
-              }
-              ticketMap.get(ticketId)!.projects.add(repo.name)
+      try {
+        const comparison = await compareBranches(String(repo.id), from, to, c.env.GITLAB_TOKEN) as any
+        for (const commit of (comparison.commits || [])) {
+          const foundTickets = extractTickets(commit.message)
+          for (const ticketId of foundTickets) {
+            if (excludedSet.has(ticketId.toUpperCase())) continue;
+            if (!ticketMap.has(ticketId)) {
+               ticketMap.set(ticketId, { summary: 'Loading...', assignee: 'Unassigned', projects: new Set<string>() })
             }
+            ticketMap.get(ticketId)!.projects.add(repo.name)
           }
-        } catch (e) {
-          console.error(`Error comparing ${repo.name}:`, e)
         }
-    }
+      } catch (e) {
+        // Skip projects without branch matches
+      }
   }
 
   const tickets = Array.from(ticketMap.entries()).map(([id, data]) => ({
@@ -105,7 +115,7 @@ releaseCtrl.get('/compare', async (c) => {
   }))
 
   const enrichedPromises = tickets.map(async (t) => {
-    const data = await fetchYouTrack(t.id, c.env.YOUTRACK_BASE_URL, c.env.YOUTRACK_TOKEN)
+    const data = await fetchYouTrack(t.id, c.env.YOUTRACK_BASE_URL, c.env.YOUTRACK_TOKEN) as any
     if (data) {
       t.summary = data.summary || t.summary
       t.assignee = data.assignee?.name || t.assignee

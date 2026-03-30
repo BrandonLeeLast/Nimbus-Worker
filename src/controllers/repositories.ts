@@ -1,46 +1,92 @@
 import { Hono } from 'hono'
 import { drizzle } from 'drizzle-orm/d1'
 import { eq } from 'drizzle-orm'
-import { repositories, systemSettings } from '../db/schema'
+import { systemSettings } from '../db/schema'
+import { checkBranchExists } from '../utils/gitlab'
 
 type Bindings = {
   DB: D1Database
+  GITLAB_TOKEN: string
 }
 
 const repos = new Hono<{ Bindings: Bindings }>()
 
-repos.get('/', async (c) => {
-  const db = drizzle(c.env.DB)
-  const results = await db.select().from(repositories)
-  return c.json(results)
+// Helper to get active release name
+async function getActiveRelease(db: any) {
+  const setting = await db.select().from(systemSettings).where(eq(systemSettings.key, 'ACTIVE_RELEASE')).get()
+  return setting?.value || ''
+}
+
+// Live fetch from GitLab
+repos.get('/repositories', async (c) => {
+  try {
+    const response = await fetch('https://gitlab.com/api/v4/projects?membership=true&simple=true&per_page=100', {
+      headers: { 'Authorization': `Bearer ${c.env.GITLAB_TOKEN}` }
+    })
+    if (!response.ok) throw new Error(`GitLab API error: ${response.statusText}`)
+    
+    const projects = await response.json() as any[]
+    return c.json(projects.map(p => ({
+      id: String(p.id),
+      name: p.name_with_namespace,
+      url: p.web_url,
+      provider: 'gitlab',
+      remote_id: String(p.id)
+    })))
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
+  }
 })
 
-repos.post('/', async (c) => {
-  const user = c.get('jwtPayload')
-  if (user.role !== 'admin') return c.json({ error: 'Admin only' }, 403)
-  
-  const body = await c.req.json()
+repos.get('/branches', async (c) => {
   const db = drizzle(c.env.DB)
-  
-  const id = crypto.randomUUID()
-  await db.insert(repositories).values({
-    id,
-    ...body,
-    created_at: new Date().toISOString()
-  })
-  return c.json({ id })
+  const activeRelease = await getActiveRelease(db)
+  if (!activeRelease) return c.json([])
+
+  try {
+      const projectsRes = await fetch('https://gitlab.com/api/v4/projects?membership=true&simple=true&per_page=50', {
+        headers: { 'Authorization': `Bearer ${c.env.GITLAB_TOKEN}` }
+      })
+      const projects = await projectsRes.json() as any[]
+      
+      const branchPromises = projects.map(async (p) => {
+        const exists = await checkBranchExists(String(p.id), activeRelease, c.env.GITLAB_TOKEN)
+        return exists ? { project: p.name, branch: activeRelease } : null
+      })
+      
+      const results = (await Promise.all(branchPromises)).filter(Boolean)
+      return c.json(results)
+  } catch (e: any) {
+      return c.json({ error: e.message }, 500)
+  }
 })
 
-repos.delete('/:id', async (c) => {
-  const user = c.get('jwtPayload')
-  if (user.role !== 'admin') return c.json({ error: 'Admin only' }, 403)
-  
+repos.get('/hotfixes', async (c) => {
   const db = drizzle(c.env.DB)
-  await db.delete(repositories).where(eq(repositories.id, c.req.param('id')))
-  return c.json({ success: true })
+  const activeRelease = await getActiveRelease(db)
+  
+  try {
+    // Fetch merged MRs related to the active release (matching title or labels)
+    const searchQuery = activeRelease ? `hotfix ${activeRelease}` : 'hotfix'
+    const response = await fetch(`https://gitlab.com/api/v4/merge_requests?state=merged&scope=all&search=${searchQuery}&per_page=20`, {
+      headers: { 'Authorization': `Bearer ${c.env.GITLAB_TOKEN}` }
+    })
+    if (!response.ok) throw new Error(`GitLab API error: ${response.statusText}`)
+    
+    const mrs = await response.json() as any[]
+    return c.json(mrs.map(mr => ({
+      id: String(mr.id),
+      ticket_id: mr.title.match(/INDEV-\d+|OPENBET-\d+/i)?.[0] || 'N/A',
+      ticket_summary: mr.title,
+      author: mr.author.name,
+      merged_at: mr.merged_at
+    })))
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500)
+  }
 })
 
-// Settings
+// Settings remain in D1
 repos.get('/settings', async (c) => {
   const db = drizzle(c.env.DB)
   const results = await db.select().from(systemSettings)
@@ -48,15 +94,17 @@ repos.get('/settings', async (c) => {
 })
 
 repos.post('/settings', async (c) => {
-  const user = c.get('jwtPayload')
+  const user = c.get('jwtPayload') as { id: string, role: string }
   if (user.role !== 'admin') return c.json({ error: 'Admin only' }, 403)
   
-  const { key, value } = await c.req.json()
+  const body = await c.req.json()
   const db = drizzle(c.env.DB)
   
-  await db.insert(systemSettings)
-    .values({ key, value })
-    .onConflictDoUpdate({ target: systemSettings.key, set: { value } })
+  for (const [key, value] of Object.entries(body)) {
+    await db.insert(systemSettings)
+      .values({ key, value: String(value) })
+      .onConflictDoUpdate({ target: systemSettings.key, set: { value: String(value) } })
+  }
     
   return c.json({ success: true })
 })
