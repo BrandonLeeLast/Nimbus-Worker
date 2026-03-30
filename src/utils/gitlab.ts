@@ -3,6 +3,9 @@ export const fetchGitLab = async (path: string, token: string, method = 'GET', b
     throw new Error('GITLAB_TOKEN is missing from environment');
   }
 
+  // Diagnostic logging (Masked)
+  console.log(`[GitLab] Calling ${method} ${path} with token prefix: ${token.substring(0, 6)}...`);
+
   const options: RequestInit = {
     method,
     headers: { 

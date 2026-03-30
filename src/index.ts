@@ -41,6 +41,19 @@ app.route('/api', repos)
 app.route('/api/releases', releaseCtrl)
 app.route('/api/release-docs', releaseCtrl)
 
+app.get('/api/debug-env', (c) => {
+  const user = c.get('jwtPayload') as { id: string, role: string }
+  if (user.role !== 'admin') return c.json({ error: 'Admin only' }, 403)
+  
+  return c.json({
+    has_gitlab_token: !!c.env.GITLAB_TOKEN,
+    has_db: !!c.env.DB,
+    has_kv: !!c.env.KV,
+    has_youtrack_token: !!c.env.YOUTRACK_TOKEN,
+    env_keys: Object.keys(c.env)
+  })
+})
+
 // Global Error Handler
 app.onError((err, c) => {
   console.error(`Error Logic: ${err.message}`, err.stack)
