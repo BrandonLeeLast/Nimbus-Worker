@@ -13,6 +13,8 @@ CREATE TABLE hotfixes (
   branch_id TEXT,
   pr_url TEXT,
   author TEXT,
+  developer TEXT,
+  ticket_id TEXT,
   merged_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
