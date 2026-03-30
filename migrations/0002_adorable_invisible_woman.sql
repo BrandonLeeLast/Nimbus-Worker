@@ -1,0 +1,1 @@
+ALTER TABLE `hotfixes` ADD `ticket_summary` text;

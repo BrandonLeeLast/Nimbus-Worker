@@ -15,13 +15,16 @@ export const hotfixes = sqliteTable('hotfixes', {
   author: text('author'),
   developer: text('developer'),
   ticket_id: text('ticket_id'),
+  ticket_summary: text('ticket_summary'),
   merged_at: text('merged_at'),
 });
 
 export const repositories = sqliteTable('repositories', {
   id: text('id').primaryKey(),
   name: text('name').notNull(),
-  url: text('url').notNull()
+  url: text('url').notNull(),
+  provider: text('provider').default('gitlab'), // gitlab, github
+  remote_id: text('remote_id') // Project ID for GitLab, "owner/repo" for GitHub
 });
 
 export const cleanupLogs = sqliteTable('cleanup_logs', {

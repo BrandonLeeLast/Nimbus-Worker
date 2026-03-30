@@ -8,6 +8,20 @@
       "when": 1774838511894,
       "tag": "0000_lean_swarm",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1774842869170,
+      "tag": "0001_pink_jetstream",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1774842910141,
+      "tag": "0002_adorable_invisible_woman",
+      "breakpoints": true
     }
   ]
 }
