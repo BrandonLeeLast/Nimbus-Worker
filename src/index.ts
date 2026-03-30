@@ -6,6 +6,7 @@ import { jwt } from 'hono/jwt'
 import { branches, hotfixes, repositories, users, systemSettings } from './db/schema'
 import { hashPassword, verifyPassword } from './utils/auth'
 import { sendInvitationEmail } from './utils/emails'
+import { extractTickets, normalizeTicket } from './utils/tickets'
 
 export type Bindings = {
   DB: D1Database
@@ -68,11 +69,21 @@ function parseBranchName(branchName: string) {
 async function fetchYouTrackTicket(env: Bindings, ticketId: string | null) {
   if (!ticketId || !env.YOUTRACK_TOKEN || !env.YOUTRACK_BASE_URL) return null
   try {
-    const res = await fetch(`${env.YOUTRACK_BASE_URL}/api/issues/${ticketId}?fields=summary`, {
+    const res = await fetch(`${env.YOUTRACK_BASE_URL}/api/issues/${ticketId}?fields=summary,customFields(name,value(fullName,login))`, {
       headers: { 'Authorization': `Bearer ${env.YOUTRACK_TOKEN}` }
     })
     const data: any = await res.json()
-    return data.summary || null
+    const summary = data.summary || null
+    let assignee = 'Unassigned'
+    
+    if (data.customFields) {
+      const assigneeField = data.customFields.find((f: any) => f.name === 'Assignee')
+      if (assigneeField && assigneeField.value) {
+        assignee = assigneeField.value.fullName || assigneeField.value.login || 'Unassigned'
+      }
+    }
+
+    return { summary, assignee }
   } catch (e) {
     console.error(`YouTrack fetch failed for ${ticketId}:`, e)
     return null
@@ -120,6 +131,71 @@ app.get('/api/hotfixes', async (c) => {
   const db = drizzle(c.env.DB)
   const results = await db.select().from(hotfixes).orderBy(desc(hotfixes.merged_at))
   return c.json(results)
+})
+
+app.get('/api/release-docs/compare', async (c) => {
+  const from = c.req.query('from') || 'stage'
+  const to = c.req.query('to') || 'main'
+  const db = drizzle(c.env.DB)
+  const repos = await db.select().from(repositories)
+  
+  // Fetch excluded tickets from settings
+  const settings = await db.select().from(systemSettings).where(eq(systemSettings.key, 'EXCLUDED_TICKETS'))
+  const excludedLine = settings[0]?.value || ''
+  const excludedSet = new Set(excludedLine.split(',').map(t => t.trim().toUpperCase()))
+
+  const ticketMap = new Map<string, { summary: string, assignee: string, projects: Set<string> }>()
+
+  for (const repo of repos) {
+    if (repo.provider !== 'gitlab' || !repo.remote_id) continue;
+    
+    try {
+      const resp = await fetch(`https://gitlab.com/api/v4/projects/${repo.remote_id}/repository/compare?from=${to}&to=${from}`, {
+        headers: { 'PRIVATE-TOKEN': c.env.GITLAB_TOKEN }
+      })
+      const data: any = await resp.json()
+      
+      if (data.commits) {
+        for (const commit of data.commits) {
+          // Skip merge commits from target back to source
+          if (commit.message.toLowerCase().includes(`merge branch '${to}' into '${from}'`)) continue;
+          
+          const foundTickets = extractTickets(commit.message)
+          for (const ticketId of foundTickets) {
+            if (excludedSet.has(ticketId.toUpperCase())) continue;
+            
+            if (!ticketMap.has(ticketId)) {
+               ticketMap.set(ticketId, { summary: 'Loading...', assignee: 'Unassigned', projects: new Set() })
+            }
+            ticketMap.get(ticketId)!.projects.add(repo.name)
+          }
+        }
+      }
+    } catch (e) {
+      console.error(`Compare failed for ${repo.name}:`, e)
+    }
+  }
+
+  // Enrich with YouTrack
+  const enriched: any[] = []
+  const tickets = Array.from(ticketMap.keys())
+  
+  for (const ticketId of tickets) {
+    const info = ticketMap.get(ticketId)!
+    const youtrack = await fetchYouTrackTicket(c.env, ticketId)
+    enriched.push({
+      id: ticketId,
+      summary: youtrack?.summary || 'Unable to fetch',
+      assignee: youtrack?.assignee || 'Unassigned',
+      projects: Array.from(info.projects)
+    })
+  }
+
+  return c.json({
+    from,
+    to,
+    tickets: enriched
+  })
 })
 
 app.get('/api/repositories', async (c) => {
@@ -257,7 +333,7 @@ app.post('/webhook/gitlab', async (c) => {
 
       if (attrs.state === 'merged' && isReleaseTarget(targetBranch)) {
         const { ticket } = parseBranchName(sourceBranch)
-        const summary = await fetchYouTrackTicket(c.env, ticket)
+        const youtrack = await fetchYouTrackTicket(c.env, ticket)
         
         await db.insert(hotfixes).values({
           id: crypto.randomUUID(),
@@ -266,7 +342,7 @@ app.post('/webhook/gitlab', async (c) => {
           author: realAuthor,
           developer: realAuthor,
           ticket_id: ticket,
-          ticket_summary: summary, // Assuming schema update or using existing field
+          ticket_summary: youtrack?.summary || null,
           merged_at: new Date().toISOString()
         })
       }
@@ -314,7 +390,7 @@ app.post('/webhook/github', async (c) => {
 
       if (isReleaseTarget(targetBranch)) {
         const { ticket } = parseBranchName(sourceBranch)
-        const summary = await fetchYouTrackTicket(c.env, ticket)
+        const youtrack = await fetchYouTrackTicket(c.env, ticket)
 
         await db.insert(hotfixes).values({
           id: crypto.randomUUID(),
@@ -323,7 +399,7 @@ app.post('/webhook/github', async (c) => {
           author: realAuthor,
           developer: realAuthor,
           ticket_id: ticket,
-          ticket_summary: summary,
+          ticket_summary: youtrack?.summary || null,
           merged_at: new Date().toISOString()
         })
       }
