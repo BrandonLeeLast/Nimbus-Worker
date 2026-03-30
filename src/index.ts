@@ -29,10 +29,15 @@ const app = new Hono<{ Bindings: Bindings }>()
 
 app.use('*', cors())
 
-// Auth Middleware (Optional for public dashboard, required for management)
-// We only protect management routes
+// Auth Middleware (Only protect sensitive management routes)
 app.use('/api/auth/invite', (c, next) => jwt({ secret: c.env.JWT_SECRET, alg: 'HS256' })(c, next))
-app.use('/api/repositories/*', (c, next) => jwt({ secret: c.env.JWT_SECRET, alg: 'HS256' })(c, next))
+app.use('/api/auth/reset-password', (c, next) => jwt({ secret: c.env.JWT_SECRET, alg: 'HS256' })(c, next))
+
+// Protect Repository mutations (POST/DELETE) but not GET
+app.post('/api/repositories', (c, next) => jwt({ secret: c.env.JWT_SECRET, alg: 'HS256' })(c, next))
+app.delete('/api/repositories/*', (c, next) => jwt({ secret: c.env.JWT_SECRET, alg: 'HS256' })(c, next))
+
+// Protect Settings entirely
 app.use('/api/settings/*', (c, next) => jwt({ secret: c.env.JWT_SECRET, alg: 'HS256' })(c, next))
 
 // --- Helpers ---
