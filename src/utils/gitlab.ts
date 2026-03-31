@@ -18,7 +18,7 @@ export const fetchGitLab = async (path: string, token: string, method = 'GET', b
     options.body = JSON.stringify(body);
   }
 
-  const res = await fetch(`https://gitlab.com/api/v4${path}`, options);
+  const res = await fetch(`https://gitlab.worldsportsbetting.co.za/api/v4${path}`, options);
 
   if (res.status === 401) throw new Error('GitLab: Unauthorized — GITLAB_TOKEN is invalid or expired');
   if (res.status === 403) throw new Error('GitLab: Forbidden — token lacks required scopes (needs api or read_api)');
