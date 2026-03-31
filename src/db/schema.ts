@@ -31,6 +31,7 @@ export const releases = sqliteTable('releases', {
 export const releaseDocuments = sqliteTable('release_documents', {
   id: text('id').primaryKey(),
   release_id: text('release_id').notNull(),
-  content: text('content'), // JSON or Markdown
+  type: text('type').default('snapshot'), // 'snapshot' = ticket/project data JSON
+  content: text('content'), // JSON
   generated_at: text('generated_at'),
 });
