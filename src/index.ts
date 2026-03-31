@@ -56,9 +56,9 @@ app.get('/api/debug-env', (c) => {
 app.get('/api/debug-gitlab', async (c) => {
   try {
     const data = await fetchGitLab('/user', c.env.GITLAB_TOKEN) as any
-    return c.json({ success: true, username: (Array.isArray(data) ? data[0]?.username : data?.username) || 'found' })
+    return c.json({ success: true, username: (Array.isArray(data) ? data[0]?.username : data?.username) || 'found', gitlab_url: 'https://gitlab.worldsportsbetting.co.za' })
   } catch (e: any) {
-    return c.json({ success: false, error: e.message })
+    return c.json({ success: false, error: e.message, gitlab_url: 'https://gitlab.worldsportsbetting.co.za', token_prefix: c.env.GITLAB_TOKEN?.substring(0, 10) })
   }
 })
 
