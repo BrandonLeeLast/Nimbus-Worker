@@ -1,44 +1,43 @@
 name = "nimbus-worker"
 main = "src/index.ts"
-compatibility_date = "2024-03-29"
+compatibility_date = "2024-05-01"
+compatibility_flags = ["nodejs_compat"]
 
-[observability]
-enabled = true
+[[d1_databases]]
+binding = "DB"
+database_name = "nimbus-db"
+database_id = "local"
+migrations_dir = "migrations"
 
-# STAGING ENVIRONMENT
+[[kv_namespaces]]
+binding = "NIMBUS_KV"
+id = "local"
+
+[vars]
+DEBUG = "true"
+
 [env.staging]
 name = "nimbus-worker-staging"
 
 [[env.staging.d1_databases]]
 binding = "DB"
 database_name = "nimbus-db-staging"
-database_id = "707b6c9b-e90d-40ad-a954-1dc6910071ee"
+database_id = "REPLACE_WITH_STAGING_DB_ID"
+migrations_dir = "migrations"
 
 [[env.staging.kv_namespaces]]
-binding = "KV"
-id = "74cf280630f749e3aaee3c588c425509"
+binding = "NIMBUS_KV"
+id = "REPLACE_WITH_STAGING_KV_ID"
 
-[env.staging.triggers]
-crons = ["0 0 * * *"] 
-
-[env.staging.observability]
-enabled = true
-
-# PRODUCTION ENVIRONMENT
 [env.production]
-name = "nimbus-worker-prod"
+name = "nimbus-worker-production"
 
 [[env.production.d1_databases]]
 binding = "DB"
-database_name = "nimbus-db-prod"
-database_id = "c52950d9-666a-4077-b3c3-0c5f326abeda"
+database_name = "nimbus-db-production"
+database_id = "REPLACE_WITH_PRODUCTION_DB_ID"
+migrations_dir = "migrations"
 
 [[env.production.kv_namespaces]]
-binding = "KV"
-id = "14cb432af330454bb33764e4e80a4b87"
-
-[env.production.triggers]
-crons = ["0 0 * * *"]
-
-[env.production.observability]
-enabled = true
+binding = "NIMBUS_KV"
+id = "REPLACE_WITH_PRODUCTION_KV_ID"

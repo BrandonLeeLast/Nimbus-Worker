@@ -1,84 +1,38 @@
-import { Hono } from 'hono'
-import { cors } from 'hono/cors'
-import { jwt } from 'hono/jwt'
-import auth from './controllers/auth'
-import repos from './controllers/repositories'
-import releaseCtrl from './controllers/releases'
-import webhooks from './controllers/webhooks'
-import { fetchGitLab } from './utils/gitlab'
+import { Hono } from 'hono';
+import { cors } from 'hono/cors';
+import { reposCtrl } from './controllers/repos';
+import { releasesCtrl } from './controllers/releases';
+import { webhooksCtrl } from './controllers/webhooks';
+import { settingsCtrl } from './controllers/settings';
 
-type Bindings = {
-  DB: D1Database
-  KV: KVNamespace
-  GITLAB_TOKEN: string
-  YOUTRACK_TOKEN: string
-  YOUTRACK_BASE_URL: string
-  RESEND_API_KEY: string
-  JWT_SECRET: string
-  DEBUG: string
+export interface Env {
+  DB: D1Database;
+  NIMBUS_KV: KVNamespace;
+  GITLAB_TOKEN: string;
+  YOUTRACK_TOKEN: string;
+  YOUTRACK_BASE_URL: string;
+  DEBUG?: string;
 }
 
-const app = new Hono<{ Bindings: Bindings }>()
+const app = new Hono<{ Bindings: Env }>();
 
-// Middleware
-app.use('*', cors())
+app.use('*', cors({
+  origin: ['http://localhost:5173', 'http://localhost:4173'],
+  allowHeaders: ['Content-Type'],
+  allowMethods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+}));
 
-// Public Routes
-app.route('/api/auth', auth)
-app.route('/webhook', webhooks)
+app.route('/api/repos', reposCtrl);
+app.route('/api/releases', releasesCtrl);
+app.route('/api/webhooks', webhooksCtrl);
+app.route('/api/settings', settingsCtrl);
 
-// Protected Routes (JWT required for mutations and private data)
-app.use('/api/*', (c, next) => {
-  // Allow public GET for dashboard and releases
-  const publicPaths = ['/api/repositories', '/api/branches', '/api/hotfixes', '/api/releases', '/api/settings', '/api/release-docs/compare', '/api/debug-env', '/api/debug-gitlab']
-  if (c.req.method === 'GET' && publicPaths.includes(c.req.path)) {
-    return next()
-  }
-  const jwtMiddleware = jwt({ secret: c.env.JWT_SECRET, alg: 'HS256' })
-  return jwtMiddleware(c, next)
-})
+app.get('/api/health', (c) => c.json({ ok: true, ts: new Date().toISOString() }));
 
-app.route('/api', repos)
-app.route('/api/releases', releaseCtrl)
-app.route('/api/release-docs', releaseCtrl)
-
-app.get('/api/debug-env', (c) => {
-  return c.json({
-    has_gitlab_token: !!c.env.GITLAB_TOKEN,
-    gitlab_token_length: c.env.GITLAB_TOKEN?.length || 0,
-    gitlab_token_prefix: c.env.GITLAB_TOKEN?.substring(0, 6),
-    has_db: !!c.env.DB,
-    has_kv: !!c.env.KV,
-    env_keys: Object.keys(c.env)
-  })
-})
-
-app.get('/api/debug-gitlab', async (c) => {
-  try {
-    const data = await fetchGitLab('/user', c.env.GITLAB_TOKEN) as any
-    return c.json({ success: true, username: (Array.isArray(data) ? data[0]?.username : data?.username) || 'found', gitlab_url: 'https://gitlab.worldsportsbetting.co.za' })
-  } catch (e: any) {
-    return c.json({ success: false, error: e.message, gitlab_url: 'https://gitlab.worldsportsbetting.co.za', token_prefix: c.env.GITLAB_TOKEN?.substring(0, 10) })
-  }
-})
-
-// Global Error Handler
+app.notFound((c) => c.json({ error: 'Not found' }, 404));
 app.onError((err, c) => {
-  console.error(`Error Logic: ${err.message}`, err.stack)
-  return c.json({ 
-    error: err.message, 
-    stack: c.env.DEBUG === 'true' ? err.stack : undefined 
-  }, 500)
-})
+  console.error(err);
+  return c.json({ error: err.message }, 500);
+});
 
-app.notFound((c) => {
-  return c.json({ error: 'Not Found', path: c.req.path }, 404)
-})
-
-// --- Scheduled Cron Job ---
-export default {
-  fetch: app.fetch,
-  async scheduled(event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) {
-    console.log("Cron event trigger: Cleanup logic is currently disabled for safety.")
-  }
-}
+export default app;
