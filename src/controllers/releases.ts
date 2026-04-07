@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
 import { eq, and } from 'drizzle-orm';
 import { releases, releaseRepos, releaseDocuments, repositories, systemSettings } from '../db/schema';
-import { compareRefs, createBranch, branchExists, extractTicketIds, getMergedMRs, batchSequential } from '../utils/gitlab';
+import { compareRefs, createBranch, branchExists, extractTicketIds, getMergedMRs, batchSequential, isCommitOnMain } from '../utils/gitlab';
 import { getTickets } from '../utils/youtrack';
 import type { Env } from '../index';
 
@@ -452,6 +452,27 @@ releasesCtrl.put('/:id/document', async (c) => {
 });
 
 // ─── Staging pipeline: commits on stage not yet on main ───────────────────────
+// Hybrid approach:
+// 1. Pattern matching catches obvious cases (backmerges, hotfix merges, release merges) — zero API cost
+// 2. Remaining merge commits get checked via refs API (is commit reachable from main?) — a few calls
+// 3. Regular (non-merge) commits are always shown as pending — they don't have the "different SHA" problem
+
+// Patterns for merge commits where code IS on main (via workflow)
+const BACKMERGE_MAIN_RE = /^Merge branch ['"]?main['"]? into/i;
+const BACKMERGE_MASTER_RE = /^Merge branch ['"]?master['"]? into/i;
+const BACKMERGE_STAGE_RE = /^Merge branch ['"]?stage['"]? into/i;
+const HOTFIX_MERGE_RE = /^Merge branch ['"]?hotfix\//i;
+const RELEASE_MERGE_RE = /^Merge branch ['"]?release-/i;
+const ANY_MERGE_RE = /^Merge branch /i;
+
+function detectOnMainByPattern(title: string): string | null {
+  if (BACKMERGE_MAIN_RE.test(title) || BACKMERGE_MASTER_RE.test(title)) return 'backmerge';
+  if (BACKMERGE_STAGE_RE.test(title)) return 'stage sync';
+  if (HOTFIX_MERGE_RE.test(title)) return 'hotfix→release→main';
+  if (RELEASE_MERGE_RE.test(title)) return 'release backmerge';
+  return null;
+}
+
 releasesCtrl.get('/:id/pipeline', async (c) => {
   const releaseId = c.req.param('id');
   const db = drizzle(c.env.DB);
@@ -466,14 +487,37 @@ releasesCtrl.get('/:id/pipeline', async (c) => {
     if (!repo.project_id) return { repo: repo.name, path: repo.gitlab_path, commits: [], error: 'no project_id' };
     try {
       const compare = await compareRefs(repo.project_id, 'main', 'stage', c.env.GITLAB_TOKEN);
-      const commits = (compare.commits ?? []).map(cm => ({
+      const rawCommits = compare.commits ?? [];
+
+      // Step 1: Pattern match all commits
+      const mapped = rawCommits.map(cm => ({
         id: cm.short_id,
+        fullSha: cm.id,
         title: cm.title,
         author: cm.author_name,
         date: cm.created_at,
         url: cm.web_url,
         tickets: extractTicketIds(cm.title),
+        onMainVia: detectOnMainByPattern(cm.title),
+        isMerge: ANY_MERGE_RE.test(cm.title),
       }));
+
+      // Step 2: For merge commits NOT caught by patterns, check via refs API
+      const uncheckedMerges = mapped.filter(cm => cm.isMerge && !cm.onMainVia);
+      if (uncheckedMerges.length > 0) {
+        // Check in parallel, these are typically only a few
+        await Promise.all(uncheckedMerges.map(async (cm) => {
+          const onMain = await isCommitOnMain(repo.project_id!, cm.fullSha, c.env.GITLAB_TOKEN);
+          if (onMain) cm.onMainVia = 'verified on main';
+        }));
+      }
+
+      // Build final output (drop fullSha and isMerge from response)
+      const commits = mapped.map(({ fullSha: _, isMerge: __, ...rest }) => rest);
+
+      // Sort by date desc
+      commits.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime());
+
       return { repo: repo.name, path: repo.gitlab_path, commits };
     } catch (e) {
       return { repo: repo.name, path: repo.gitlab_path, commits: [], error: String(e) };

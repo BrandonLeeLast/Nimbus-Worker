@@ -48,6 +48,7 @@ export interface CompareResult {
 }
 
 // Compare two refs — used to find commits on `from` not yet on `to`
+// Uses straight=false (merge-base) to handle commits merged via different paths
 export async function compareRefs(
   projectId: string,
   from: string,
@@ -55,7 +56,7 @@ export async function compareRefs(
   token: string
 ): Promise<CompareResult> {
   const res = await gitlabFetch(
-    `/projects/${encodeURIComponent(projectId)}/repository/compare?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&straight=true`,
+    `/projects/${encodeURIComponent(projectId)}/repository/compare?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
     token
   );
   if (!res.ok) {
@@ -166,7 +167,7 @@ export async function countAheadCommits(
 ): Promise<number> {
   try {
     const res = await gitlabFetch(
-      `/projects/${encodeURIComponent(projectId)}/repository/compare?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&straight=true`,
+      `/projects/${encodeURIComponent(projectId)}/repository/compare?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
       token
     );
     if (!res.ok) return 0;
@@ -188,8 +189,12 @@ export interface ClassifiedCommits {
 const BACKMERGE_PATTERNS = [
   /^Merge branch 'main'/i,
   /^Merge branch 'master'/i,
+  /^Merge branch 'stage'/i,              // merging stage into feature branch
   /^Merge remote-tracking branch 'origin\/main'/i,
   /^Merge remote-tracking branch 'origin\/master'/i,
+  /^Merge remote-tracking branch 'origin\/stage'/i,
+  /^Merge branch ['"]?release-/i,         // release backmerge into stage
+  /^Merge branch ['"]?hotfix\/.*into ['"]?stage/i, // hotfix merged to stage (already on main via release)
 ];
 
 const HOTFIX_PATTERNS = [
@@ -198,6 +203,7 @@ const HOTFIX_PATTERNS = [
 ];
 
 function classifyCommit(title: string): 'feature' | 'hotfix' | 'backmerge' {
+  // Check backmerge first — hotfix merges INTO STAGE are backmerges, not real hotfixes
   if (BACKMERGE_PATTERNS.some(p => p.test(title))) return 'backmerge';
   if (HOTFIX_PATTERNS.some(p => p.test(title))) return 'hotfix';
   return 'feature';
@@ -212,7 +218,7 @@ export async function getClassifiedAheadCommits(
 ): Promise<ClassifiedCommits> {
   try {
     const res = await gitlabFetch(
-      `/projects/${encodeURIComponent(projectId)}/repository/compare?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&straight=true`,
+      `/projects/${encodeURIComponent(projectId)}/repository/compare?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
       token
     );
     if (!res.ok) return { total: 0, featureCount: 0, hotfixCount: 0, backmergeCount: 0 };
@@ -252,4 +258,78 @@ export async function batchSequential<T, R>(
     }
   }
   return results;
+}
+
+// Get recent commits on a branch (for finding what's been merged to main)
+export async function getRecentCommits(
+  projectId: string,
+  ref: string,
+  perPage: number,
+  token: string
+): Promise<GitLabCommit[]> {
+  const res = await gitlabFetch(
+    `/projects/${encodeURIComponent(projectId)}/repository/commits?ref_name=${encodeURIComponent(ref)}&per_page=${perPage}`,
+    token
+  );
+  if (!res.ok) return [];
+  return res.json() as Promise<GitLabCommit[]>;
+}
+
+// Check which branches/tags contain a specific commit
+// Returns { branches: string[], tags: string[] }
+export async function getCommitRefs(
+  projectId: string,
+  sha: string,
+  token: string
+): Promise<{ branches: string[]; tags: string[] }> {
+  const res = await gitlabFetch(
+    `/projects/${encodeURIComponent(projectId)}/repository/commits/${sha}/refs?type=all`,
+    token
+  );
+  if (!res.ok) return { branches: [], tags: [] };
+  const refs = await res.json() as { type: string; name: string }[];
+  return {
+    branches: refs.filter(r => r.type === 'branch').map(r => r.name),
+    tags: refs.filter(r => r.type === 'tag').map(r => r.name),
+  };
+}
+
+// Check if a commit is on main (i.e., main branch contains this commit)
+export async function isCommitOnMain(
+  projectId: string,
+  sha: string,
+  token: string
+): Promise<boolean> {
+  const refs = await getCommitRefs(projectId, sha, token);
+  return refs.branches.includes('main') || refs.branches.includes('master');
+}
+
+// Extract source branch from merge commit title
+// "Merge branch 'hotfix/foo' into 'main'" -> "hotfix/foo"
+// "Merge branch 'release-20260323' into 'main'" -> "release-20260323"
+export function extractMergedBranch(title: string): string | null {
+  const match = title.match(/^Merge branch ['"]([^'"]+)['"]/i);
+  return match ? match[1] : null;
+}
+
+// Get set of branches that have been merged into a target branch
+export async function getMergedBranchNames(
+  projectId: string,
+  targetBranch: string,
+  token: string,
+  lookbackCommits = 100
+): Promise<Set<string>> {
+  const commits = await getRecentCommits(projectId, targetBranch, lookbackCommits, token);
+  const branches = new Set<string>();
+
+  for (const commit of commits) {
+    const branch = extractMergedBranch(commit.title);
+    if (branch) {
+      branches.add(branch);
+      // Also add without prefix for fuzzy matching
+      // e.g., "release-20260323" might be merged via "Merge branch 'release-20260323' into 'stage'"
+    }
+  }
+
+  return branches;
 }
