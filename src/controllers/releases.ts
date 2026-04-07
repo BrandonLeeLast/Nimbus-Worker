@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
 import { eq, and } from 'drizzle-orm';
 import { releases, releaseRepos, releaseDocuments, repositories, systemSettings } from '../db/schema';
-import { compareRefs, createBranch, branchExists, extractTicketIds, getMergedMRs, batchSequential, isCommitOnMain } from '../utils/gitlab';
+import { compareRefs, createBranch, branchExists, extractTicketIds, getMergedMRs, batchSequential, isCommitOnMain, createMergeRequest } from '../utils/gitlab';
 import { getTickets } from '../utils/youtrack';
 import type { Env } from '../index';
 
@@ -525,6 +525,46 @@ releasesCtrl.get('/:id/pipeline', async (c) => {
   });
 
   return c.json(results);
+});
+
+// ─── Create merge requests: release branch → main ─────────────────────────────
+releasesCtrl.post('/:id/create-mrs', async (c) => {
+  const releaseId = c.req.param('id');
+  const db = drizzle(c.env.DB);
+
+  const [release] = await db.select().from(releases).where(eq(releases.id, releaseId)).limit(1);
+  if (!release) return c.json({ error: 'Not found' }, 404);
+
+  const rows = await db
+    .select({ rr: releaseRepos, repo: repositories })
+    .from(releaseRepos)
+    .innerJoin(repositories, eq(releaseRepos.repo_id, repositories.id))
+    .where(eq(releaseRepos.release_id, releaseId));
+
+  const mrTitle = `Deploy: Merge ${release.branch_name} into main`;
+
+  const results = await batchSequential(rows, 3, 300, async ({ repo }) => {
+    if (!repo.project_id) return { repo: repo.name, result: 'skipped', error: 'no project_id' };
+    try {
+      const mr = await createMergeRequest(
+        repo.project_id,
+        release.branch_name,
+        'main',
+        mrTitle,
+        c.env.GITLAB_TOKEN
+      );
+      return {
+        repo: repo.name,
+        result: mr.created ? 'created' : (mr.error ?? 'already exists'),
+        url: mr.url ?? null,
+        iid: mr.iid ?? null,
+      };
+    } catch (e) {
+      return { repo: repo.name, result: 'error', error: String(e) };
+    }
+  });
+
+  return c.json({ branch: release.branch_name, results });
 });
 
 // ─── Hotfixes: MRs merged to main ────────────────────────────────────────────

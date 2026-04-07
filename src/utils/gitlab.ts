@@ -76,6 +76,48 @@ export async function getMergedMRs(projectId: string, targetBranch: string, toke
   return res.json() as Promise<GitLabMR[]>;
 }
 
+// Create a merge request
+export async function createMergeRequest(
+  projectId: string,
+  sourceBranch: string,
+  targetBranch: string,
+  title: string,
+  token: string
+): Promise<{ created: boolean; iid?: number; url?: string; error?: string }> {
+  const res = await fetch(`${GITLAB_BASE}/projects/${encodeURIComponent(projectId)}/merge_requests`, {
+    method: 'POST',
+    headers: { 'PRIVATE-TOKEN': token, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      source_branch: sourceBranch,
+      target_branch: targetBranch,
+      title,
+      remove_source_branch: false,
+    }),
+  });
+
+  if (res.status === 409) {
+    // MR already exists — find the existing one
+    const existing = await gitlabFetch(
+      `/projects/${encodeURIComponent(projectId)}/merge_requests?source_branch=${encodeURIComponent(sourceBranch)}&target_branch=${encodeURIComponent(targetBranch)}&state=opened&per_page=1`,
+      token
+    );
+    if (existing.ok) {
+      const mrs = await existing.json() as { iid: number; web_url: string }[];
+      if (mrs[0]) return { created: false, iid: mrs[0].iid, url: mrs[0].web_url, error: 'already exists' };
+    }
+    return { created: false, error: 'already exists' };
+  }
+  if (res.status === 401) throw new Error('GitLab: Unauthorized');
+  if (res.status === 403) throw new Error('GitLab: Forbidden');
+  if (!res.ok) {
+    const body = await res.text();
+    return { created: false, error: `${res.status}: ${body}` };
+  }
+
+  const mr = await res.json() as { iid: number; web_url: string };
+  return { created: true, iid: mr.iid, url: mr.web_url };
+}
+
 // Create a branch from a source ref
 export async function createBranch(
   projectId: string,
