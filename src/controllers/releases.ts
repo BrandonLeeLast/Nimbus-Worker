@@ -3,7 +3,7 @@ import { drizzle } from 'drizzle-orm/d1';
 import { eq, and } from 'drizzle-orm';
 import { releases, releaseRepos, releaseDocuments, repositories, systemSettings } from '../db/schema';
 import { compareRefs, createBranch, branchExists, extractTicketIds, getMergedMRs, batchSequential, isCommitOnMain, createMergeRequest } from '../utils/gitlab';
-import { getTickets } from '../utils/youtrack';
+import { getTickets, getTicketsByQuery, getSprints } from '../utils/youtrack';
 import type { Env } from '../index';
 
 export const releasesCtrl = new Hono<{ Bindings: Env }>();
@@ -31,6 +31,16 @@ releasesCtrl.get('/active', async (c) => {
     .where(eq(releaseRepos.release_id, release.id));
 
   return c.json({ ...release, repos: rRepos });
+});
+
+// ─── YouTrack sprints ─────────────────────────────────────────────────────────
+releasesCtrl.get('/youtrack-sprints', async (c) => {
+  const cacheKey = 'youtrack_sprints';
+  const cached = await c.env.NIMBUS_KV.get(cacheKey, 'json');
+  if (cached) return c.json(cached);
+  const sprints = await getSprints(c.env.YOUTRACK_BASE_URL, c.env.YOUTRACK_TOKEN);
+  await c.env.NIMBUS_KV.put(cacheKey, JSON.stringify(sprints), { expirationTtl: 300 });
+  return c.json(sprints);
 });
 
 // ─── Get single release ───────────────────────────────────────────────────────
@@ -170,6 +180,7 @@ releasesCtrl.post('/:id/repos', async (c) => {
     notes: notes ?? null,
   }).onConflictDoNothing();
 
+  await c.env.NIMBUS_KV.delete(`branch_status:${releaseId}`);
   return c.json({ success: true, id: rrId });
 });
 
@@ -186,8 +197,10 @@ releasesCtrl.put('/:id/repos/:repoId', async (c) => {
 // ─── Remove repo from release ─────────────────────────────────────────────────
 releasesCtrl.delete('/:id/repos/:repoId', async (c) => {
   const db = drizzle(c.env.DB);
+  const releaseId = c.req.param('id');
   await db.delete(releaseRepos)
-    .where(and(eq(releaseRepos.release_id, c.req.param('id')), eq(releaseRepos.id, c.req.param('repoId'))));
+    .where(and(eq(releaseRepos.release_id, releaseId), eq(releaseRepos.id, c.req.param('repoId'))));
+  await c.env.NIMBUS_KV.delete(`branch_status:${releaseId}`);
   return c.json({ success: true });
 });
 
@@ -245,6 +258,7 @@ releasesCtrl.post('/:id/create-branches', async (c) => {
     }
   });
 
+  await c.env.NIMBUS_KV.delete(`branch_status:${releaseId}`);
   return c.json({ branch: release.branch_name, results });
 });
 
@@ -309,17 +323,31 @@ releasesCtrl.post('/:id/generate', async (c) => {
 
     try {
       // Compare main → release branch to find what's in this release
-      const compare = await compareRefs(repo.project_id, 'main', release.branch_name, c.env.GITLAB_TOKEN);
+      const [compare, mergedMRs] = await Promise.all([
+        compareRefs(repo.project_id, 'main', release.branch_name, c.env.GITLAB_TOKEN),
+        getMergedMRs(repo.project_id, release.branch_name, c.env.GITLAB_TOKEN),
+      ]);
       const allCommits = compare.commits ?? [];
-      // Apply same merge-commit filter as the pipeline view
+
+      const ticketIds: string[] = [];
+
+      // 1. Extract from commit titles (catches tickets referenced directly in commits)
+      for (const commit of allCommits) {
+        extractTicketIds(commit.title).forEach(t => ticketIds.push(t));
+      }
+
+      // 2. Extract from MR source branch names + MR titles merged into this release branch.
+      //    This catches cases where a commit has no ticket ID but lives on a branch like
+      //    "Michalis/INDEV-3833_Popular-bets-fixes" or the MR title references the ticket.
+      for (const mr of mergedMRs) {
+        extractTicketIds(mr.source_branch).forEach(t => ticketIds.push(t));
+        extractTicketIds(mr.title).forEach(t => ticketIds.push(t));
+      }
+
+      // Filter merge commits from the visible list only (display/count)
       const commits = hideMergeCommits
         ? allCommits.filter(cm => !MERGE_RE.test(cm.title))
         : allCommits;
-      const ticketIds: string[] = [];
-
-      for (const commit of commits) {
-        extractTicketIds(commit.title).forEach(t => ticketIds.push(t));
-      }
 
       const uniqueTicketIds = [...new Set(ticketIds)];
       uniqueTicketIds.forEach(t => allTicketIds.add(t));
@@ -639,4 +667,89 @@ releasesCtrl.get('/:id/hotfixes', async (c) => {
 
   await c.env.NIMBUS_KV.put(cacheKey, JSON.stringify(results), { expirationTtl: 300 });
   return c.json(results);
+});
+
+// ─── Recon ────────────────────────────────────────────────────────────────────
+// Cross-references tickets found in release commits against YouTrack board state.
+// Returns:
+//   - releaseTickets: every ticket found in commits, with current YT state + repo(s)
+//   - stageOnlyTickets: tickets on YT board in stage states but NOT in this release
+releasesCtrl.get('/:id/recon', async (c) => {
+  const releaseId = c.req.param('id');
+  const sprintName = c.req.query('sprint') ?? '';
+  const cacheKey = `recon:${releaseId}:${sprintName}`;
+  const cached = await c.env.NIMBUS_KV.get(cacheKey, 'json');
+  if (cached) return c.json(cached);
+
+  const db = drizzle(c.env.DB);
+
+  // Load saved doc to get ticket IDs we already know about from commits
+  const [docRow] = await db.select().from(releaseDocuments).where(eq(releaseDocuments.release_id, releaseId)).limit(1);
+  if (!docRow) return c.json({ error: 'No generated document found — generate the release doc first' }, 400);
+
+  const doc = JSON.parse(docRow.content) as {
+    repos: { name: string; path: string; tickets: { id: string; title: string; assignee: string; excluded: boolean }[] }[];
+  };
+
+  // Build map of ticketId -> repos it appears in
+  const ticketRepoMap = new Map<string, string[]>();
+  for (const repo of doc.repos) {
+    for (const t of repo.tickets) {
+      if (!ticketRepoMap.has(t.id)) ticketRepoMap.set(t.id, []);
+      ticketRepoMap.get(t.id)!.push(repo.name);
+    }
+  }
+
+  const releaseTicketIds = [...ticketRepoMap.keys()];
+
+  // Fetch fresh current state for all release tickets from YouTrack
+  const ytMap = await getTickets(releaseTicketIds, c.env.YOUTRACK_BASE_URL, c.env.YOUTRACK_TOKEN);
+
+  const releaseTickets = releaseTicketIds.map(id => {
+    const yt = ytMap.get(id);
+    const repoTicket = doc.repos.flatMap(r => r.tickets).find(t => t.id === id);
+    return {
+      id,
+      title: yt?.summary ?? repoTicket?.title ?? id,
+      assignee: yt?.assignee ?? repoTicket?.assignee ?? '',
+      state: yt?.state ?? 'Unknown',
+      priority: yt?.priority ?? '',
+      repos: ticketRepoMap.get(id) ?? [],
+      excluded: repoTicket?.excluded ?? false,
+    };
+  });
+
+  // Get configured YouTrack project (falls back to prefixes derived from release tickets)
+  const projectSetting = await db.select().from(systemSettings).where(eq(systemSettings.key, 'YOUTRACK_PROJECT')).limit(1);
+  let projectPrefixes: string[];
+  if (projectSetting[0]?.value) {
+    projectPrefixes = projectSetting[0].value.split(',').map((p: string) => p.trim()).filter(Boolean);
+  } else {
+    projectPrefixes = [...new Set(releaseTicketIds.map(id => id.split('-')[0]).filter(Boolean))];
+  }
+  const projectFilter = projectPrefixes.map(p => `project: ${p}`).join(' OR ');
+  const stateFilter = 'State: {Staging} OR State: {Stage Testing} OR State: {Stage Approved}';
+  const sprintFilter = sprintName ? ` AND Sprint: {${sprintName}}` : '';
+  const stageQuery = projectPrefixes.length
+    ? `(${projectFilter}) AND (${stateFilter})${sprintFilter}`
+    : `${stateFilter}${sprintFilter}`;
+
+  // Fetch all tickets currently in stage states from YouTrack board (optionally filtered by sprint)
+  const stageTickets = await getTicketsByQuery(stageQuery, c.env.YOUTRACK_BASE_URL, c.env.YOUTRACK_TOKEN);
+
+  // Stage-only = on board in stage state but not in this release
+  const releaseIdSet = new Set(releaseTicketIds);
+  const stageOnlyTickets = stageTickets
+    .filter(t => !releaseIdSet.has(t.id))
+    .map(t => ({
+      id: t.id,
+      title: t.summary,
+      assignee: t.assignee ?? '',
+      state: t.state ?? 'Unknown',
+      priority: t.priority ?? '',
+    }));
+
+  const payload = { releaseTickets, stageOnlyTickets };
+  await c.env.NIMBUS_KV.put(cacheKey, JSON.stringify(payload), { expirationTtl: 300 });
+  return c.json(payload);
 });

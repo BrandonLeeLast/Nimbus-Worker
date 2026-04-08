@@ -71,3 +71,82 @@ export async function getTickets(
   }
   return map;
 }
+
+export interface YouTrackSprint {
+  id: string;
+  name: string;
+  board: string; // agile board name
+  start?: number;
+  finish?: number;
+  archived: boolean;
+}
+
+export async function getSprints(baseUrl: string, token: string): Promise<YouTrackSprint[]> {
+  const res = await fetch(`${baseUrl}/api/agiles?fields=id,name,sprints(id,name,start,finish,archived)&$top=50`, {
+    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+  });
+  if (!res.ok) return [];
+
+  const boards = await res.json() as {
+    id: string;
+    name: string;
+    sprints?: { id: string; name: string; start?: number; finish?: number; archived: boolean }[];
+  }[];
+
+  const results: YouTrackSprint[] = [];
+  for (const board of boards) {
+    for (const sprint of board.sprints ?? []) {
+      results.push({ id: sprint.id, name: sprint.name, board: board.name, start: sprint.start, finish: sprint.finish, archived: sprint.archived });
+    }
+  }
+
+  // Sort: non-archived first, then by finish date desc
+  return results.sort((a, b) => {
+    if (a.archived !== b.archived) return a.archived ? 1 : -1;
+    return (b.finish ?? 0) - (a.finish ?? 0);
+  });
+}
+
+// Query YouTrack for all tickets matching a state query, paginated
+export async function getTicketsByQuery(
+  query: string,
+  baseUrl: string,
+  token: string,
+  maxTickets = 500,
+): Promise<YouTrackTicket[]> {
+  const fields = 'id,idReadable,summary,customFields(name,value(name,login,fullName))';
+  const perPage = 100;
+  const results: YouTrackTicket[] = [];
+
+  for (let skip = 0; skip < maxTickets; skip += perPage) {
+    const url = `${baseUrl}/api/issues?query=${encodeURIComponent(query)}&fields=${fields}&$top=${perPage}&$skip=${skip}`;
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    });
+    if (!res.ok) break;
+    const batch = await res.json() as {
+      id: string;
+      idReadable: string;
+      summary: string;
+      customFields?: { name: string; value: { name?: string; login?: string; fullName?: string } | null }[];
+    }[];
+    if (!batch.length) break;
+
+    for (const data of batch) {
+      const assigneeField = data.customFields?.find(f => f.name === 'Assignee');
+      const stateField = data.customFields?.find(f => f.name === 'State');
+      const priorityField = data.customFields?.find(f => f.name === 'Priority');
+      results.push({
+        id: data.idReadable ?? data.id,
+        summary: data.summary,
+        assignee: assigneeField?.value?.fullName ?? assigneeField?.value?.name,
+        state: stateField?.value?.name,
+        priority: priorityField?.value?.name,
+      });
+    }
+
+    if (batch.length < perPage) break;
+  }
+
+  return results;
+}
