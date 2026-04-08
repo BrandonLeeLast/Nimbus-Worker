@@ -53,11 +53,17 @@ reposCtrl.delete('/:id', async (c) => {
   return c.json({ success: true });
 });
 
-// Live GitLab project search for the picker
+// Live GitLab project search — cached in KV for 1 hour per query
 reposCtrl.get('/gitlab-search', async (c) => {
   const query = c.req.query('q') ?? '';
   if (!query || query.length < 2) return c.json([]);
+
+  const cacheKey = `gitlab_search:${query.toLowerCase()}`;
+  const cached = await c.env.NIMBUS_KV.get(cacheKey, 'json');
+  if (cached) return c.json(cached);
+
   const results = await searchProjects(query, c.env.GITLAB_TOKEN);
+  await c.env.NIMBUS_KV.put(cacheKey, JSON.stringify(results), { expirationTtl: 3600 });
   return c.json(results);
 });
 
@@ -104,9 +110,18 @@ reposCtrl.get('/active', async (c) => {
     }
   );
 
-  // Filter out repos with ONLY back-merges (no features or hotfixes)
+  // Load scan-excluded repo paths
+  let excludedPaths: Set<string> = new Set();
+  try {
+    const excRow = await db.select().from(systemSettings).where(eq(systemSettings.key, 'SCAN_EXCLUDED_REPOS')).get();
+    if (excRow?.value) {
+      excludedPaths = new Set(excRow.value.split(',').map((p: string) => p.trim()).filter(Boolean));
+    }
+  } catch { /* use empty set */ }
+
+  // Filter out repos with ONLY back-merges (no features or hotfixes), and scan-excluded repos
   const filtered = results
-    .filter(r => r.commitCount > 0)
+    .filter(r => r.commitCount > 0 && !excludedPaths.has(r.gitlab_path))
     .sort((a, b) => b.commitCount - a.commitCount);
 
   // Cache for 5 minutes

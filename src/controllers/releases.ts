@@ -102,6 +102,28 @@ releasesCtrl.post('/', async (c) => {
   return c.json({ success: true, id, name, branch_name, branches: branchResults });
 });
 
+// ─── Delete release (and all associated data) ────────────────────────────────
+releasesCtrl.delete('/:id', async (c) => {
+  const releaseId = c.req.param('id');
+  const db = drizzle(c.env.DB);
+
+  const [release] = await db.select().from(releases).where(eq(releases.id, releaseId)).limit(1);
+  if (!release) return c.json({ error: 'Not found' }, 404);
+
+  // Clear ACTIVE_RELEASE setting if this is the active one
+  const setting = await db.select().from(systemSettings).where(eq(systemSettings.key, 'ACTIVE_RELEASE')).limit(1);
+  if (setting[0]?.value === releaseId) {
+    await db.delete(systemSettings).where(eq(systemSettings.key, 'ACTIVE_RELEASE'));
+  }
+
+  // Delete all associated data
+  await db.delete(releaseDocuments).where(eq(releaseDocuments.release_id, releaseId));
+  await db.delete(releaseRepos).where(eq(releaseRepos.release_id, releaseId));
+  await db.delete(releases).where(eq(releases.id, releaseId));
+
+  return c.json({ success: true });
+});
+
 // ─── Complete / deploy release ────────────────────────────────────────────────
 releasesCtrl.post('/:id/complete', async (c) => {
   const releaseId = c.req.param('id');
@@ -173,6 +195,10 @@ releasesCtrl.delete('/:id/repos/:repoId', async (c) => {
 // Returns per-repo whether the release branch exists on GitLab
 releasesCtrl.get('/:id/branch-status', async (c) => {
   const releaseId = c.req.param('id');
+  const cacheKey = `branch_status:${releaseId}`;
+  const cached = await c.env.NIMBUS_KV.get(cacheKey, 'json');
+  if (cached) return c.json(cached);
+
   const db = drizzle(c.env.DB);
 
   const [release] = await db.select().from(releases).where(eq(releases.id, releaseId)).limit(1);
@@ -190,7 +216,9 @@ releasesCtrl.get('/:id/branch-status', async (c) => {
     return { repoId: repo.id, name: repo.name, exists, error: null as string | null };
   });
 
-  return c.json({ branch: release.branch_name, repos: results });
+  const payload = { branch: release.branch_name, repos: results };
+  await c.env.NIMBUS_KV.put(cacheKey, JSON.stringify(payload), { expirationTtl: 300 });
+  return c.json(payload);
 });
 
 // ─── Create branches for existing release ────────────────────────────────────
@@ -475,6 +503,10 @@ function detectOnMainByPattern(title: string): string | null {
 
 releasesCtrl.get('/:id/pipeline', async (c) => {
   const releaseId = c.req.param('id');
+  const cacheKey = `pipeline:${releaseId}`;
+  const cached = await c.env.NIMBUS_KV.get(cacheKey, 'json');
+  if (cached) return c.json(cached);
+
   const db = drizzle(c.env.DB);
 
   const rows = await db
@@ -524,6 +556,7 @@ releasesCtrl.get('/:id/pipeline', async (c) => {
     }
   });
 
+  await c.env.NIMBUS_KV.put(cacheKey, JSON.stringify(results), { expirationTtl: 300 });
   return c.json(results);
 });
 
@@ -570,6 +603,10 @@ releasesCtrl.post('/:id/create-mrs', async (c) => {
 // ─── Hotfixes: MRs merged to main ────────────────────────────────────────────
 releasesCtrl.get('/:id/hotfixes', async (c) => {
   const releaseId = c.req.param('id');
+  const cacheKey = `hotfixes:${releaseId}`;
+  const cached = await c.env.NIMBUS_KV.get(cacheKey, 'json');
+  if (cached) return c.json(cached);
+
   const db = drizzle(c.env.DB);
 
   const rows = await db
@@ -600,5 +637,6 @@ releasesCtrl.get('/:id/hotfixes', async (c) => {
     }
   });
 
+  await c.env.NIMBUS_KV.put(cacheKey, JSON.stringify(results), { expirationTtl: 300 });
   return c.json(results);
 });
