@@ -100,8 +100,16 @@ export async function getSprints(baseUrl: string, token: string): Promise<YouTra
     }
   }
 
+  // Deduplicate by sprint name (same sprint can appear across multiple boards)
+  const seen = new Set<string>();
+  const unique = results.filter(s => {
+    if (seen.has(s.name)) return false;
+    seen.add(s.name);
+    return true;
+  });
+
   // Sort: non-archived first, then by finish date desc
-  return results.sort((a, b) => {
+  return unique.sort((a, b) => {
     if (a.archived !== b.archived) return a.archived ? 1 : -1;
     return (b.finish ?? 0) - (a.finish ?? 0);
   });

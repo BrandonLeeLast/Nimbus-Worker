@@ -39,3 +39,11 @@ export const releaseDocuments = sqliteTable('release_documents', {
   generated_at: text('generated_at'),
   updated_at: text('updated_at'),
 });
+
+export const executiveDocuments = sqliteTable('executive_documents', {
+  id: text('id').primaryKey(),
+  release_id: text('release_id').notNull().unique(),
+  content: text('content').notNull(),   // JSON string of ExecDoc
+  generated_at: text('generated_at'),
+  updated_at: text('updated_at'),
+});

@@ -8,6 +8,7 @@ import { settingsCtrl } from './controllers/settings';
 export interface Env {
   DB: D1Database;
   NIMBUS_KV: KVNamespace;
+  AI: Ai;
   GITLAB_TOKEN: string;
   YOUTRACK_TOKEN: string;
   YOUTRACK_BASE_URL: string;

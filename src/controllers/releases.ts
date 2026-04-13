@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { drizzle } from 'drizzle-orm/d1';
 import { eq, and } from 'drizzle-orm';
-import { releases, releaseRepos, releaseDocuments, repositories, systemSettings } from '../db/schema';
+import { releases, releaseRepos, releaseDocuments, repositories, systemSettings, executiveDocuments } from '../db/schema';
 import { compareRefs, createBranch, branchExists, extractTicketIds, getMergedMRs, batchSequential, isCommitOnMain, createMergeRequest } from '../utils/gitlab';
 import { getTickets, getTicketsByQuery, getSprints } from '../utils/youtrack';
 import type { Env } from '../index';
@@ -329,16 +329,36 @@ releasesCtrl.post('/:id/generate', async (c) => {
       ]);
       const allCommits = compare.commits ?? [];
 
+      // Filter out commits that are actually already on main.
+      // Only merge commits can have SHA mismatches (same code, different SHA) —
+      // regular commits don't have this problem so skip the API check for them.
+      // Step 1: pattern-match obvious backmerges (free)
+      // Step 2: verify remaining unchecked merge commits via refs API
+      const mapped = allCommits.map(cm => ({
+        ...cm,
+        isMerge: MERGE_RE.test(cm.title),
+        onMain: detectOnMainByPattern(cm.title) !== null,
+      }));
+
+      const uncheckedMerges = mapped.filter(cm => cm.isMerge && !cm.onMain);
+      if (uncheckedMerges.length > 0) {
+        await Promise.all(uncheckedMerges.map(async (cm) => {
+          const onMain = await isCommitOnMain(repo.project_id!, cm.id, c.env.GITLAB_TOKEN);
+          if (onMain) cm.onMain = true;
+        }));
+      }
+
+      const trueCommits = mapped.filter(cm => !cm.onMain);
+
       const ticketIds: string[] = [];
 
-      // 1. Extract from commit titles (catches tickets referenced directly in commits)
-      for (const commit of allCommits) {
+      // 1. Extract from commit titles of commits genuinely not on main
+      for (const commit of trueCommits) {
         extractTicketIds(commit.title).forEach(t => ticketIds.push(t));
       }
 
-      // 2. Extract from MR source branch names + MR titles merged into this release branch.
-      //    This catches cases where a commit has no ticket ID but lives on a branch like
-      //    "Michalis/INDEV-3833_Popular-bets-fixes" or the MR title references the ticket.
+      // 2. Extract from MR source branch names + titles merged into this release branch.
+      //    Catches commits with no ticket ID in title but on a branch like Michalis/INDEV-3833_...
       for (const mr of mergedMRs) {
         extractTicketIds(mr.source_branch).forEach(t => ticketIds.push(t));
         extractTicketIds(mr.title).forEach(t => ticketIds.push(t));
@@ -346,8 +366,8 @@ releasesCtrl.post('/:id/generate', async (c) => {
 
       // Filter merge commits from the visible list only (display/count)
       const commits = hideMergeCommits
-        ? allCommits.filter(cm => !MERGE_RE.test(cm.title))
-        : allCommits;
+        ? trueCommits.filter(cm => !cm.isMerge)
+        : trueCommits;
 
       const uniqueTicketIds = [...new Set(ticketIds)];
       uniqueTicketIds.forEach(t => allTicketIds.add(t));
@@ -752,4 +772,569 @@ releasesCtrl.get('/:id/recon', async (c) => {
   const payload = { releaseTickets, stageOnlyTickets };
   await c.env.NIMBUS_KV.put(cacheKey, JSON.stringify(payload), { expirationTtl: 300 });
   return c.json(payload);
+});
+
+// ─── Executive Documents ─────────────────────────────────────────────────────
+
+// GET saved executive doc
+releasesCtrl.get('/:id/executive', async (c) => {
+  const db = drizzle(c.env.DB);
+  const [row] = await db.select().from(executiveDocuments).where(eq(executiveDocuments.release_id, c.req.param('id'))).limit(1);
+  if (!row) return c.json(null);
+  return c.json({ ...row, content: JSON.parse(row.content) });
+});
+
+// PUT save/update executive doc (manual edits)
+releasesCtrl.put('/:id/executive', async (c) => {
+  const releaseId = c.req.param('id');
+  const body = await c.req.json() as Record<string, unknown>;
+  const db = drizzle(c.env.DB);
+  const now = new Date().toISOString();
+  const content = JSON.stringify(body);
+
+  const [existing] = await db.select().from(executiveDocuments).where(eq(executiveDocuments.release_id, releaseId)).limit(1);
+  if (existing) {
+    await db.update(executiveDocuments).set({ content, updated_at: now }).where(eq(executiveDocuments.release_id, releaseId));
+  } else {
+    await db.insert(executiveDocuments).values({ id: crypto.randomUUID(), release_id: releaseId, content, generated_at: now, updated_at: now });
+  }
+  return c.json({ ok: true });
+});
+
+// POST generate executive doc with Workers AI
+releasesCtrl.post('/:id/executive/generate', async (c) => {
+  const releaseId = c.req.param('id');
+  const db = drizzle(c.env.DB);
+
+  // Load the release doc (source data)
+  const [docRow] = await db.select().from(releaseDocuments).where(eq(releaseDocuments.release_id, releaseId)).limit(1);
+  if (!docRow) return c.json({ error: 'Generate the release document first' }, 400);
+
+  const [release] = await db.select().from(releases).where(eq(releases.id, releaseId)).limit(1);
+  if (!release) return c.json({ error: 'Release not found' }, 404);
+
+  const releaseDoc = JSON.parse(docRow.content) as {
+    releaseLead: string;
+    releaseBackup: string;
+    overallRisk: string;
+    riskFactors: Record<string, boolean>;
+    riskNotes: string[];
+    overview: string;
+    summary: { totalCommits: number; totalTickets: number; reposModified: number; reposTotal: number };
+    repos: { name: string; path: string; commitCount: number; tickets: { id: string; title: string; assignee: string; notes: string; excluded: boolean }[] }[];
+  };
+
+  // Collect all non-excluded tickets
+  const allTickets: { id: string; title: string; assignee: string; repo: string; notes: string }[] = [];
+  for (const repo of releaseDoc.repos) {
+    for (const t of repo.tickets) {
+      if (!t.excluded) allTickets.push({ id: t.id, title: t.title, assignee: t.assignee, repo: repo.name, notes: t.notes });
+    }
+  }
+
+  const repoNames = releaseDoc.repos.map(r => r.name);
+  const activeRiskFactors = Object.entries(releaseDoc.riskFactors ?? {}).filter(([, v]) => v).map(([k]) => k.replace(/([A-Z])/g, ' $1').trim());
+
+  // Build the prompt for Workers AI
+  const ticketList = allTickets.map(t => `- ${t.id}: ${t.title}${t.notes ? ` (Note: ${t.notes})` : ''} [Repo: ${t.repo}]`).join('\n');
+
+  const prompt = `You are a technical writer creating executive-level release documentation. Write for non-technical stakeholders (executives, product managers, customer support).
+
+RELEASE INFO:
+- Name: ${release.name}
+- Date: ${release.created_at ?? 'TBD'}
+- Release Lead: ${releaseDoc.releaseLead || 'TBD'}
+- Overall Risk: ${releaseDoc.overallRisk || 'Low'}
+- Active Risk Factors: ${activeRiskFactors.join(', ') || 'None'}
+- Risk Notes: ${(releaseDoc.riskNotes ?? []).join('; ') || 'None'}
+- Total Commits: ${releaseDoc.summary.totalCommits}
+- Projects: ${repoNames.join(', ')} (${repoNames.length} total)
+
+TICKETS IN THIS RELEASE (${allTickets.length} total):
+${ticketList}
+
+INSTRUCTIONS:
+Generate a JSON response with this EXACT structure (no markdown, just raw JSON):
+{
+  "executiveSummary": "2-3 paragraphs summarizing the release in business terms. Focus on customer impact, business value. No technical jargon.",
+  "features": [{"name": "Feature Name", "description": "1-2 sentence business description"}],
+  "improvements": [{"name": "Improvement Name", "description": "1-2 sentence description"}],
+  "fixes": [{"name": "Fix Name", "description": "1-2 sentence customer impact description"}],
+  "customerExperience": "1-2 paragraphs on customer impact",
+  "operationalEfficiency": "1-2 paragraphs on operational improvements",
+  "revenueGrowth": "1-2 paragraphs on revenue/growth implications",
+  "riskMitigation": "1-2 paragraphs on risk reduction",
+  "totalChanges": "${allTickets.length} tickets across ${repoNames.length} systems",
+  "projectsUpdated": "description of backend/frontend split",
+  "keyIntegrations": "list any third-party integrations mentioned",
+  "riskFactors": ["plain language risk factor 1", "risk factor 2"],
+  "mitigationStrategies": ["mitigation strategy 1", "strategy 2"],
+  "ticketSummaries": [{"id": "TICKET-ID", "summary": "Plain-language 1-sentence summary of what this change means for users/business"}]
+}
+
+RULES:
+- Every ticket from the list MUST appear in ticketSummaries
+- Categorize tickets into features (new functionality), improvements (enhancements), and fixes (bug fixes)
+- Write in active voice: "Enables X" not "X is enabled"
+- No technical jargon: "login security" not "auth token validation"
+- Focus on business impact and customer value
+- Return ONLY valid JSON, no markdown wrapping`;
+
+  try {
+    const aiResult = await c.env.AI.run('@cf/meta/llama-3.1-70b-instruct' as any, {
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 4096,
+    }) as { response?: string };
+
+    const raw = aiResult.response ?? '';
+
+    // Try to extract JSON from the response
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      const jsonMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/) ?? raw.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) return c.json({ error: 'AI returned invalid response', raw }, 500);
+      parsed = JSON.parse(jsonMatch[1] ?? jsonMatch[0]);
+    }
+
+    // Build the executive doc
+    const execDoc = {
+      releaseName: release.name,
+      releaseDate: release.created_at ?? '',
+      releaseLead: releaseDoc.releaseLead ?? '',
+      executiveSummary: parsed.executiveSummary ?? '',
+      features: parsed.features ?? [],
+      improvements: parsed.improvements ?? [],
+      fixes: parsed.fixes ?? [],
+      customerExperience: parsed.customerExperience ?? '',
+      operationalEfficiency: parsed.operationalEfficiency ?? '',
+      revenueGrowth: parsed.revenueGrowth ?? '',
+      riskMitigation: parsed.riskMitigation ?? '',
+      totalChanges: parsed.totalChanges ?? `${allTickets.length} tickets`,
+      projectsUpdated: parsed.projectsUpdated ?? `${repoNames.length} projects`,
+      keyIntegrations: parsed.keyIntegrations ?? '',
+      overallRisk: releaseDoc.overallRisk ?? 'Low',
+      riskFactors: parsed.riskFactors ?? [],
+      mitigationStrategies: parsed.mitigationStrategies ?? [],
+      ticketSummaries: parsed.ticketSummaries ?? allTickets.map(t => ({ id: t.id, summary: t.title })),
+    };
+
+    // Save to DB
+    const now = new Date().toISOString();
+    const content = JSON.stringify(execDoc);
+    const [existing] = await db.select().from(executiveDocuments).where(eq(executiveDocuments.release_id, releaseId)).limit(1);
+    if (existing) {
+      await db.update(executiveDocuments).set({ content, updated_at: now }).where(eq(executiveDocuments.release_id, releaseId));
+    } else {
+      await db.insert(executiveDocuments).values({ id: crypto.randomUUID(), release_id: releaseId, content, generated_at: now, updated_at: now });
+    }
+
+    return c.json(execDoc);
+  } catch (e) {
+    return c.json({ error: `AI generation failed: ${e}` }, 500);
+  }
+});
+
+// ─── Export executive overview as markdown ─────────────────────────────────
+releasesCtrl.get('/:id/executive/overview-markdown', async (c) => {
+  const db = drizzle(c.env.DB);
+  const [row] = await db.select().from(executiveDocuments).where(eq(executiveDocuments.release_id, c.req.param('id'))).limit(1);
+  if (!row) return c.json({ error: 'Executive document not found' }, 404);
+
+  const doc = JSON.parse(row.content) as Record<string, unknown>;
+  const features = (doc.features as Array<{ name: string; description: string }> | undefined) ?? [];
+  const improvements = (doc.improvements as Array<{ name: string; description: string }> | undefined) ?? [];
+  const fixes = (doc.fixes as Array<{ name: string; description: string }> | undefined) ?? [];
+  const riskFactors = (doc.riskFactors as string[] | undefined) ?? [];
+  const mitigationStrategies = (doc.mitigationStrategies as string[] | undefined) ?? [];
+
+  const markdown = `# Executive Release Overview
+
+**Release Name:** ${doc.releaseName ?? 'TBD'}  
+**Release Date:** ${doc.releaseDate ? new Date(doc.releaseDate as string).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) : 'TBD'}  
+**Release Lead:** ${doc.releaseLead ?? 'TBD'}
+
+---
+
+## Executive Summary
+
+${doc.executiveSummary ?? 'No summary available.'}
+
+---
+
+## Key Deliverables
+
+### New Features & Capabilities
+
+${features.map(f => `- **${f.name}**: ${f.description}`).join('\n')}
+
+### Platform Improvements
+
+${improvements.map(i => `- **${i.name}**: ${i.description}`).join('\n')}
+
+### Critical Fixes
+
+${fixes.map(f => `- **${f.name}**: ${f.description}`).join('\n')}
+
+---
+
+## Business Impact
+
+### Customer Experience
+
+${doc.customerExperience ?? 'No customer experience data.'}
+
+### Operational Efficiency
+
+${doc.operationalEfficiency ?? 'No operational efficiency data.'}
+
+### Revenue & Growth
+
+${doc.revenueGrowth ?? 'No revenue growth data.'}
+
+### Risk Mitigation
+
+${doc.riskMitigation ?? 'No risk mitigation data.'}
+
+---
+
+## Release Scope
+
+**Total Changes:** ${doc.totalChanges ?? 'N/A'}  
+**Projects Updated:** ${doc.projectsUpdated ?? 'N/A'}  
+**Key Integrations:** ${doc.keyIntegrations ?? 'None'}
+
+---
+
+## Risk Assessment
+
+**Overall Risk Level:** ${doc.overallRisk ?? 'Low'}
+
+### Key Risk Factors:
+${riskFactors.map(rf => `- ${rf}`).join('\n')}
+
+### Mitigation Strategies:
+${mitigationStrategies.map(ms => `- ${ms}`).join('\n')}
+
+---
+
+**Document Version:** 1.0  
+**Last Updated:** ${row.updated_at ? new Date(row.updated_at).toLocaleDateString() : 'N/A'}`;
+
+  return c.text(markdown, 200, { 'Content-Type': 'text/markdown; charset=utf-8', 'Content-Disposition': `attachment; filename="Release-${String(doc.releaseName ?? 'Executive').replace(/\s+/g, '-')}-ExecutiveOverview.md"` });
+});
+
+// ─── Export executive ticket summaries as markdown ────────────────────────
+releasesCtrl.get('/:id/executive/summaries-markdown', async (c) => {
+  const db = drizzle(c.env.DB);
+  const [row] = await db.select().from(executiveDocuments).where(eq(executiveDocuments.release_id, c.req.param('id'))).limit(1);
+  if (!row) return c.json({ error: 'Executive document not found' }, 404);
+
+  const doc = JSON.parse(row.content) as Record<string, unknown>;
+  const ticketSummaries = (doc.ticketSummaries as Array<{ id: string; summary: string }> | undefined) ?? [];
+
+  const markdown = `# Executive Ticket Summaries
+
+**Release:** ${doc.releaseName ?? 'TBD'}  
+**Release Date:** ${doc.releaseDate ? new Date(doc.releaseDate as string).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) : 'TBD'}
+
+This document provides plain-language summaries of each ticket included in the release.
+
+---
+
+${ticketSummaries.map((t: { id: string; summary: string }) => `[${t.id}] - ${t.summary}`).join('\n\n')}
+
+---
+
+**Document Version:** 1.0  
+**Last Updated:** ${row.updated_at ? new Date(row.updated_at).toLocaleDateString() : 'N/A'}`;
+
+  return c.text(markdown, 200, { 'Content-Type': 'text/markdown; charset=utf-8', 'Content-Disposition': `attachment; filename="Release-${String(doc.releaseName ?? 'Executive').replace(/\s+/g, '-')}-ExecutiveTicketSummaries.md"` });
+});
+
+// ─── Preview executive overview as HTML ───────────────────────────────────
+releasesCtrl.get('/:id/executive/overview-preview', async (c) => {
+  const db = drizzle(c.env.DB);
+  const [row] = await db.select().from(executiveDocuments).where(eq(executiveDocuments.release_id, c.req.param('id'))).limit(1);
+  if (!row) return c.json({ error: 'Executive document not found' }, 404);
+
+  const doc = JSON.parse(row.content) as Record<string, unknown>;
+  const features = (doc.features as Array<{ name: string; description: string }> | undefined) ?? [];
+  const improvements = (doc.improvements as Array<{ name: string; description: string }> | undefined) ?? [];
+  const fixes = (doc.fixes as Array<{ name: string; description: string }> | undefined) ?? [];
+  const riskFactors = (doc.riskFactors as string[] | undefined) ?? [];
+  const mitigationStrategies = (doc.mitigationStrategies as string[] | undefined) ?? [];
+
+  const releaseDate = doc.releaseDate ? new Date(doc.releaseDate as string).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) : 'TBD';
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Executive Release Overview - ${doc.releaseName ?? 'Release'}</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #333; background: #f5f5f5; padding: 40px 20px; }
+    .container { max-width: 900px; margin: 0 auto; background: white; padding: 60px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    h1 { font-size: 32px; margin: 0 0 30px 0; padding-bottom: 15px; border-bottom: 3px solid #d84a36; }
+    h2 { font-size: 20px; margin: 30px 0 15px 0; padding-bottom: 10px; border-bottom: 1px solid #ddd; }
+    h3 { font-size: 16px; margin: 20px 0 10px 0; color: #555; }
+    .section { margin-bottom: 40px; }
+    .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-bottom: 30px; padding: 15px; background: #f9f9f9; border-radius: 6px; }
+    .info-item { }
+    .info-label { font-weight: 600; color: #666; font-size: 12px; text-transform: uppercase; margin-bottom: 5px; }
+    .info-value { font-size: 16px; color: #333; }
+    ul { margin: 15px 0; padding-left: 20px; }
+    li { margin: 8px 0; }
+    li strong { color: #d84a36; }
+    .subsection-title { font-weight: 600; margin: 15px 0 10px 0; font-size: 14px; }
+    p { margin: 10px 0; }
+    .risk-high { color: #d32f2f; }
+    .risk-medium { color: #f57c00; }
+    .risk-low { color: #388e3c; }
+    @media (max-width: 768px) {
+      .container { padding: 30px; }
+      h1 { font-size: 24px; }
+      .info-grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Executive Release Overview</h1>
+    
+    <div class="section">
+      <h2>Release Information</h2>
+      <div class="info-grid">
+        <div class="info-item">
+          <div class="info-label">Release Name</div>
+          <div class="info-value">${doc.releaseName ?? 'TBD'}</div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">Release Date</div>
+          <div class="info-value">${releaseDate}</div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">Release Lead</div>
+          <div class="info-value">${doc.releaseLead ?? 'TBD'}</div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">Overall Risk Level</div>
+          <div class="info-value risk-${(doc.overallRisk ?? 'low').toLowerCase()}">${doc.overallRisk ?? 'Low'}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Executive Summary</h2>
+      <p>${String(doc.executiveSummary ?? 'No summary available.').replace(/\n/g, '</p><p>')}</p>
+    </div>
+
+    <div class="section">
+      <h2>Key Deliverables</h2>
+      
+      <div class="subsection-title">New Features & Capabilities</div>
+      <ul>
+        ${features.map((f: { name: string; description: string }) => `<li><strong>${f.name}:</strong> ${f.description}</li>`).join('\n')}
+      </ul>
+
+      <div class="subsection-title">Platform Improvements</div>
+      <ul>
+        ${improvements.map((i: { name: string; description: string }) => `<li><strong>${i.name}:</strong> ${i.description}</li>`).join('\n')}
+      </ul>
+
+      <div class="subsection-title">Critical Fixes</div>
+      <ul>
+        ${fixes.map((f: { name: string; description: string }) => `<li><strong>${f.name}:</strong> ${f.description}</li>`).join('\n')}
+      </ul>
+    </div>
+
+    <div class="section">
+      <h2>Business Impact</h2>
+      
+      <div class="subsection-title">Customer Experience</div>
+      <p>${String(doc.customerExperience ?? 'No data').replace(/\n/g, '</p><p>')}</p>
+
+      <div class="subsection-title">Operational Efficiency</div>
+      <p>${String(doc.operationalEfficiency ?? 'No data').replace(/\n/g, '</p><p>')}</p>
+
+      <div class="subsection-title">Revenue & Growth</div>
+      <p>${String(doc.revenueGrowth ?? 'No data').replace(/\n/g, '</p><p>')}</p>
+
+      <div class="subsection-title">Risk Mitigation</div>
+      <p>${String(doc.riskMitigation ?? 'No data').replace(/\n/g, '</p><p>')}</p>
+    </div>
+
+    <div class="section">
+      <h2>Release Scope</h2>
+      <div class="info-grid">
+        <div class="info-item">
+          <div class="info-label">Total Changes</div>
+          <div class="info-value">${doc.totalChanges ?? 'N/A'}</div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">Projects Updated</div>
+          <div class="info-value">${doc.projectsUpdated ?? 'N/A'}</div>
+        </div>
+      </div>
+      <div class="info-item" style="margin-top: 15px;">
+        <div class="info-label">Key Integrations</div>
+        <div class="info-value">${doc.keyIntegrations ?? 'None'}</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <h2>Risk Assessment</h2>
+      <h3>Key Risk Factors:</h3>
+      <ul>
+        ${riskFactors.map((rf: string) => `<li>${rf}</li>`).join('\n')}
+      </ul>
+      <h3>Mitigation Strategies:</h3>
+      <ul>
+        ${mitigationStrategies.map((ms: string) => `<li>${ms}</li>`).join('\n')}
+      </ul>
+    </div>
+
+    <div style="margin-top: 60px; padding-top: 20px; border-top: 1px solid #ddd; font-size: 12px; color: #999;">
+      <p>Document Version: 1.0<br>Last Updated: ${row.updated_at ? new Date(row.updated_at).toLocaleDateString() : 'N/A'}</p>
+    </div>
+  </div>
+</body>
+</html>`;
+
+  return c.html(html);
+});
+
+// ─── Preview executive ticket summaries as HTML ────────────────────────────
+releasesCtrl.get('/:id/executive/summaries-preview', async (c) => {
+  const db = drizzle(c.env.DB);
+  const [row] = await db.select().from(executiveDocuments).where(eq(executiveDocuments.release_id, c.req.param('id'))).limit(1);
+  if (!row) return c.json({ error: 'Executive document not found' }, 404);
+
+  const doc = JSON.parse(row.content) as Record<string, unknown>;
+  const ticketSummaries = (doc.ticketSummaries as Array<{ id: string; summary: string }> | undefined) ?? [];
+  const releaseDate = doc.releaseDate ? new Date(doc.releaseDate as string).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) : 'TBD';
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Executive Ticket Summaries - ${doc.releaseName ?? 'Release'}</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; color: #333; background: #f5f5f5; padding: 40px 20px; }
+    .container { max-width: 900px; margin: 0 auto; background: white; padding: 60px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    h1 { font-size: 32px; margin: 0 0 30px 0; padding-bottom: 15px; border-bottom: 3px solid #d84a36; }
+    h2 { font-size: 18px; margin: 0 0 20px 0; color: #666; font-weight: 600; }
+    .ticket { margin: 20px 0; padding: 15px; background: #f9f9f9; border-left: 4px solid #d84a36; border-radius: 4px; }
+    .ticket-id { font-weight: 600; color: #d84a36; font-size: 14px; }
+    .ticket-summary { margin-top: 8px; color: #333; }
+    @media (max-width: 768px) {
+      .container { padding: 30px; }
+      h1 { font-size: 24px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Executive Ticket Summaries</h1>
+    
+    <h2>Release: ${doc.releaseName ?? 'TBD'}</h2>
+    <h2>Release Date: ${releaseDate}</h2>
+    
+    <p style="margin: 30px 0; color: #666;">This document provides plain-language summaries of each ticket included in the release.</p>
+
+    <div style="margin-top: 40px;">
+      ${ticketSummaries.map((t: { id: string; summary: string }) => `
+        <div class="ticket">
+          <div class="ticket-id">[${t.id}]</div>
+          <div class="ticket-summary">${t.summary}</div>
+        </div>
+      `).join('\n')}
+    </div>
+
+    <div style="margin-top: 60px; padding-top: 20px; border-top: 1px solid #ddd; font-size: 12px; color: #999;">
+      <p>Document Version: 1.0<br>Last Updated: ${row.updated_at ? new Date(row.updated_at).toLocaleDateString() : 'N/A'}</p>
+    </div>
+  </div>
+</body>
+</html>`;
+
+  return c.html(html);
+});
+
+// ─── Export executive overview as PDF (printable HTML) ──────────────────────
+releasesCtrl.get('/:id/executive/overview-pdf', async (c) => {
+  const db = drizzle(c.env.DB);
+  const [row] = await db.select().from(executiveDocuments).where(eq(executiveDocuments.release_id, c.req.param('id'))).limit(1);
+  if (!row) return c.json({ error: 'Executive document not found' }, 404);
+
+  const doc = JSON.parse(row.content) as Record<string, unknown>;
+  const features = (doc.features as Array<{ name: string; description: string }> | undefined) ?? [];
+  const improvements = (doc.improvements as Array<{ name: string; description: string }> | undefined) ?? [];
+  const fixes = (doc.fixes as Array<{ name: string; description: string }> | undefined) ?? [];
+  const riskFactors = (doc.riskFactors as string[] | undefined) ?? [];
+  const mitigationStrategies = (doc.mitigationStrategies as string[] | undefined) ?? [];
+  const releaseDate = doc.releaseDate ? new Date(doc.releaseDate as string).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) : 'TBD';
+
+  const pdfHtml = `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Executive Release Overview</title><style>body{font-family:'Segoe UI';line-height:1.6;color:#333;margin:0;padding:20px;}h1{font-size:28px;margin:0 0 20px;border-bottom:3px solid #d84a36;padding-bottom:10px;}h2{font-size:16px;margin:20px 0 10px;border-bottom:1px solid #ddd;padding-bottom:8px;}h3{font-size:14px;margin:15px 0 8px;}ul{margin:10px 0 10px 20px;}li{margin:6px 0;}strong{color:#d84a36;}p{margin:8px 0;}@media print{body{margin:0;padding:0;}}</style></head><body>
+<h1>Executive Release Overview</h1>
+<p><strong>Release Name:</strong> ${doc.releaseName ?? 'TBD'}</p>
+<p><strong>Release Date:</strong> ${releaseDate}</p>
+<p><strong>Release Lead:</strong> ${doc.releaseLead ?? 'TBD'}</p>
+<h2>Executive Summary</h2>
+<p>${String(doc.executiveSummary ?? 'No summary available.').replace(/\n/g, '</p><p>')}</p>
+<h2>Key Deliverables</h2>
+<h3>New Features & Capabilities</h3>
+<ul>${features.map((f: { name: string; description: string }) => `<li><strong>${f.name}:</strong> ${f.description}</li>`).join('')}</ul>
+<h3>Platform Improvements</h3>
+<ul>${improvements.map((i: { name: string; description: string }) => `<li><strong>${i.name}:</strong> ${i.description}</li>`).join('')}</ul>
+<h3>Critical Fixes</h3>
+<ul>${fixes.map((f: { name: string; description: string }) => `<li><strong>${f.name}:</strong> ${f.description}</li>`).join('')}</ul>
+<h2>Business Impact</h2>
+<h3>Customer Experience</h3>
+<p>${String(doc.customerExperience ?? 'No data').replace(/\n/g, '</p><p>')}</p>
+<h3>Operational Efficiency</h3>
+<p>${String(doc.operationalEfficiency ?? 'No data').replace(/\n/g, '</p><p>')}</p>
+<h3>Revenue & Growth</h3>
+<p>${String(doc.revenueGrowth ?? 'No data').replace(/\n/g, '</p><p>')}</p>
+<h3>Risk Mitigation</h3>
+<p>${String(doc.riskMitigation ?? 'No data').replace(/\n/g, '</p><p>')}</p>
+<h2>Release Scope</h2>
+<p><strong>Total Changes:</strong> ${doc.totalChanges ?? 'N/A'}</p>
+<p><strong>Projects Updated:</strong> ${doc.projectsUpdated ?? 'N/A'}</p>
+<p><strong>Key Integrations:</strong> ${doc.keyIntegrations ?? 'None'}</p>
+<h2>Risk Assessment</h2>
+<p><strong>Overall Risk Level:</strong> ${doc.overallRisk ?? 'Low'}</p>
+<h3>Key Risk Factors:</h3>
+<ul>${riskFactors.map((rf: string) => `<li>${rf}</li>`).join('')}</ul>
+<h3>Mitigation Strategies:</h3>
+<ul>${mitigationStrategies.map((ms: string) => `<li>${ms}</li>`).join('')}</ul>
+</body></html>`;
+
+  return c.html(pdfHtml, 200, { 'Content-Disposition': `attachment; filename="Release-${String(doc.releaseName ?? 'Executive').replace(/\s+/g, '-')}-ExecutiveOverview.html"` });
+});
+
+// ─── Export executive ticket summaries as PDF (printable HTML) ──────────────
+releasesCtrl.get('/:id/executive/summaries-pdf', async (c) => {
+  const db = drizzle(c.env.DB);
+  const [row] = await db.select().from(executiveDocuments).where(eq(executiveDocuments.release_id, c.req.param('id'))).limit(1);
+  if (!row) return c.json({ error: 'Executive document not found' }, 404);
+
+  const doc = JSON.parse(row.content) as Record<string, unknown>;
+  const ticketSummaries = (doc.ticketSummaries as Array<{ id: string; summary: string }> | undefined) ?? [];
+  const releaseDate = doc.releaseDate ? new Date(doc.releaseDate as string).toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }) : 'TBD';
+
+  const pdfHtml = `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>Executive Ticket Summaries</title><style>body{font-family:'Segoe UI';line-height:1.6;color:#333;margin:0;padding:20px;}h1{font-size:28px;margin:0 0 20px;border-bottom:3px solid #d84a36;padding-bottom:10px;}.ticket{margin:12px 0;padding:10px;background:#f9f9f9;border-left:3px solid #d84a36;}.ticket-id{font-weight:600;color:#d84a36;font-size:11px;}.ticket-summary{margin-top:6px;color:#333;font-size:12px;}@media print{body{margin:0;padding:0;}}</style></head><body>
+<h1>Executive Ticket Summaries</h1>
+<p><strong>Release:</strong> ${doc.releaseName ?? 'TBD'}</p>
+<p><strong>Release Date:</strong> ${releaseDate}</p>
+<p style="margin:20px 0;color:#666;">This document provides plain-language summaries of each ticket included in the release.</p>
+${ticketSummaries.map((t: { id: string; summary: string }) => `<div class="ticket"><div class="ticket-id">[${t.id}]</div><div class="ticket-summary">${t.summary}</div></div>`).join('\n')}
+</body></html>`;
+
+  return c.html(pdfHtml, 200, { 'Content-Disposition': `attachment; filename="Release-${String(doc.releaseName ?? 'Executive').replace(/\s+/g, '-')}-ExecutiveTicketSummaries.html"` });
 });
