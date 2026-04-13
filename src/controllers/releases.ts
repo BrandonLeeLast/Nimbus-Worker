@@ -352,8 +352,9 @@ releasesCtrl.post('/:id/generate', async (c) => {
 
       const ticketIds: string[] = [];
 
-      // 1. Extract from commit titles of commits genuinely not on main
-      for (const commit of trueCommits) {
+      // 1. Extract ticket IDs from ALL commits (including hotfix merges, backmerges)
+      //    so hotfixes merged into release branch still get their tickets picked up.
+      for (const commit of allCommits) {
         extractTicketIds(commit.title).forEach(t => ticketIds.push(t));
       }
 
@@ -393,24 +394,100 @@ releasesCtrl.post('/:id/generate', async (c) => {
     }
   });
 
+  // Normalize ticket prefixes to configured YouTrack project(s).
+  // e.g. OB-3970 → INDEV-3970 when YOUTRACK_PROJECT = "INDEV"
+  const ytProjectSetting = await db.select().from(systemSettings).where(eq(systemSettings.key, 'YOUTRACK_PROJECT')).limit(1);
+  const ytProjects = ytProjectSetting[0]?.value?.split(',').map((p: string) => p.trim().toUpperCase()).filter(Boolean) ?? [];
+
+  const normalizeTicketId = (id: string): string => {
+    if (!ytProjects.length) return id;
+    const [prefix, num] = id.split('-');
+    // If the prefix is already a known YouTrack project, keep it
+    if (ytProjects.includes(prefix.toUpperCase())) return id;
+    // Otherwise remap to the first configured project (e.g. OB-3970 → INDEV-3970)
+    return `${ytProjects[0]}-${num}`;
+  };
+
+  // Remap allTicketIds and each repo's ticketIds
+  const normalizedAllTicketIds = new Set<string>();
+  for (const id of allTicketIds) normalizedAllTicketIds.add(normalizeTicketId(id));
+
+  for (const repo of repoData) {
+    repo.ticketIds = repo.ticketIds.map(normalizeTicketId);
+  }
+
   // Enrich with YouTrack
-  const ticketMap = await getTickets([...allTicketIds], c.env.YOUTRACK_BASE_URL, c.env.YOUTRACK_TOKEN);
+  const ticketMap = await getTickets([...normalizedAllTicketIds], c.env.YOUTRACK_BASE_URL, c.env.YOUTRACK_TOKEN);
+
+  // Detect suspicious tickets by comparing release date vs ticket activity + sprint
+  const allSprints = await getSprints(c.env.YOUTRACK_BASE_URL, c.env.YOUTRACK_TOKEN);
+  const currentTime = Date.now();
+  const releaseCreated = new Date(release.created_at ?? Date.now()).getTime();
+
+  // Current sprint + previous sprint (tickets may linger one sprint)
+  const currentSprint = allSprints.find(s => !s.archived && s.start && s.finish && s.start <= currentTime && currentTime <= s.finish);
+  const recentSprintNames = new Set<string>();
+  if (currentSprint) {
+    recentSprintNames.add(currentSprint.name);
+    const sortedActive = allSprints.filter(s => !s.archived && s.finish).sort((a, b) => (b.finish ?? 0) - (a.finish ?? 0));
+    const curIdx = sortedActive.findIndex(s => s.name === currentSprint.name);
+    if (curIdx >= 0 && curIdx + 1 < sortedActive.length) recentSprintNames.add(sortedActive[curIdx + 1].name);
+  }
+
+  const GAP_MS = 3 * 30 * 24 * 60 * 60 * 1000; // 3 months
+
+  // States considered healthy for a release — anything else gets flagged
+  const HEALTHY_STATES = new Set([
+    'Stage Approved', 'Stage Testing', 'Staging',
+    'Production Testing', 'Production', 'Closed',
+    'Done', 'Verified', 'Deployed',
+  ]);
+
+  function detectSuspicious(_tid: string, yt: { state?: string; sprints?: string[]; updated?: number } | undefined): string | undefined {
+    if (!yt) return 'Ticket not found on YouTrack — possible wrong ticket number';
+    const reasons: string[] = [];
+
+    // State check: ticket not in a healthy release state
+    if (yt.state && !HEALTHY_STATES.has(yt.state)) {
+      reasons.push(`State is "${yt.state}"`);
+    }
+
+    // Date check: if ticket was last updated 3+ months before the release was created
+    if (yt.updated) {
+      const gap = releaseCreated - yt.updated;
+      if (gap > GAP_MS) {
+        const months = Math.round(gap / (30 * 24 * 60 * 60 * 1000));
+        reasons.push(`Last updated ${months} months before this release`);
+      }
+    }
+
+    // Sprint check: ticket not in current or previous sprint
+    if (recentSprintNames.size > 0 && yt.sprints && yt.sprints.length > 0) {
+      const inRecentSprint = yt.sprints.some(s => recentSprintNames.has(s));
+      if (!inRecentSprint) {
+        reasons.push(`In sprint "${yt.sprints[yt.sprints.length - 1]}", not current`);
+      }
+    }
+
+    return reasons.length ? reasons.join(' · ') : undefined;
+  }
 
   let totalTickets = 0;
   for (const repo of repoData) {
     repo.tickets = repo.ticketIds.map(tid => {
       const yt = ticketMap.get(tid);
       const excluded = excludedPatterns.some(p => tid.includes(p));
-      // Map YouTrack priority field to P1-P5 label
       const priority = yt?.priority ?? '';
+      const suspicious = detectSuspicious(tid, yt);
       return {
         id: tid,
         title: yt?.summary ?? tid,
         assignee: yt?.assignee ?? '',
         priority,
-        risk: '',    // filled in manually by user in the doc editor
-        notes: '',   // filled in manually by user in the doc editor
+        risk: '',
+        notes: '',
         excluded,
+        suspicious,
       };
     });
     totalTickets += repo.tickets.filter(t => !t.excluded).length;

@@ -5,6 +5,9 @@ export interface YouTrackTicket {
   assignee?: string;
   state?: string;
   priority?: string;
+  sprints?: string[];  // sprint names this ticket belongs to
+  updated?: number;    // epoch ms
+  resolved?: number;   // epoch ms
 }
 
 type YouTrackResult =
@@ -18,7 +21,7 @@ export async function getTicket(
 ): Promise<YouTrackResult> {
   try {
     const res = await fetch(
-      `${baseUrl}/api/issues/${encodeURIComponent(ticketId)}?fields=id,summary,description,customFields(name,value(name,login,fullName))`,
+      `${baseUrl}/api/issues/${encodeURIComponent(ticketId)}?fields=id,summary,description,updated,resolved,customFields(name,value(name,login,fullName),values(name))`,
       {
         headers: {
           Authorization: `Bearer ${token}`,
@@ -36,12 +39,20 @@ export async function getTicket(
       id: string;
       summary: string;
       description?: string;
-      customFields?: { name: string; value: { name?: string; login?: string; fullName?: string } | null }[];
+      updated?: number;
+      resolved?: number;
+      customFields?: {
+        name: string;
+        value: { name?: string; login?: string; fullName?: string } | null;
+        values?: { name?: string }[];
+      }[];
     };
 
     const assigneeField = data.customFields?.find(f => f.name === 'Assignee');
     const stateField = data.customFields?.find(f => f.name === 'State');
     const priorityField = data.customFields?.find(f => f.name === 'Priority');
+    const sprintField = data.customFields?.find(f => f.name === 'Sprint');
+    const sprintNames = sprintField?.values?.map(v => v.name).filter((n): n is string => !!n) ?? [];
 
     const ticket: YouTrackTicket = {
       id: data.id,
@@ -50,6 +61,9 @@ export async function getTicket(
       assignee: assigneeField?.value?.fullName ?? assigneeField?.value?.name,
       state: stateField?.value?.name,
       priority: priorityField?.value?.name,
+      sprints: sprintNames,
+      updated: data.updated,
+      resolved: data.resolved,
     };
 
     return { ok: true, data: ticket };
