@@ -3,7 +3,7 @@ import { drizzle } from 'drizzle-orm/d1';
 import { eq, and } from 'drizzle-orm';
 import { releases, releaseRepos, releaseDocuments, repositories, systemSettings, executiveDocuments } from '../db/schema';
 import { compareRefs, createBranch, branchExists, extractTicketIds, getMergedMRs, batchSequential, isCommitOnMain, createMergeRequest } from '../utils/gitlab';
-import { getTickets, getTicketsByQuery, getSprints } from '../utils/youtrack';
+import { getTicket, getTickets, getTicketsByQuery, getSprints } from '../utils/youtrack';
 import type { Env } from '../index';
 
 export const releasesCtrl = new Hono<{ Bindings: Env }>();
@@ -420,19 +420,13 @@ releasesCtrl.post('/:id/generate', async (c) => {
   const ticketMap = await getTickets([...normalizedAllTicketIds], c.env.YOUTRACK_BASE_URL, c.env.YOUTRACK_TOKEN);
 
   // Detect suspicious tickets by comparing release date vs ticket activity + sprint
-  const allSprints = await getSprints(c.env.YOUTRACK_BASE_URL, c.env.YOUTRACK_TOKEN);
-  const currentTime = Date.now();
   const releaseCreated = new Date(release.created_at ?? Date.now()).getTime();
 
-  // Current sprint + previous sprint (tickets may linger one sprint)
-  const currentSprint = allSprints.find(s => !s.archived && s.start && s.finish && s.start <= currentTime && currentTime <= s.finish);
+  // Use the configured DEFAULT_SPRINT setting (same one picked in Recon)
+  const sprintSetting = await db.select().from(systemSettings).where(eq(systemSettings.key, 'DEFAULT_SPRINT')).limit(1);
+  const defaultSprint = sprintSetting[0]?.value?.trim() ?? '';
   const recentSprintNames = new Set<string>();
-  if (currentSprint) {
-    recentSprintNames.add(currentSprint.name);
-    const sortedActive = allSprints.filter(s => !s.archived && s.finish).sort((a, b) => (b.finish ?? 0) - (a.finish ?? 0));
-    const curIdx = sortedActive.findIndex(s => s.name === currentSprint.name);
-    if (curIdx >= 0 && curIdx + 1 < sortedActive.length) recentSprintNames.add(sortedActive[curIdx + 1].name);
-  }
+  if (defaultSprint) recentSprintNames.add(defaultSprint);
 
   const GAP_MS = 3 * 30 * 24 * 60 * 60 * 1000; // 3 months
 
@@ -443,13 +437,92 @@ releasesCtrl.post('/:id/generate', async (c) => {
     'Done', 'Verified', 'Deployed',
   ]);
 
-  function detectSuspicious(_tid: string, yt: { state?: string; sprints?: string[]; updated?: number } | undefined): string | undefined {
-    if (!yt) return 'Ticket not found on YouTrack — possible wrong ticket number';
+  // Fetch all tickets in the current sprint for smart correction
+  let sprintTicketIds: string[] = [];
+  if (defaultSprint) {
+    const sprintTickets = await getTicketsByQuery(
+      `Sprint: {${defaultSprint}}`,
+      c.env.YOUTRACK_BASE_URL, c.env.YOUTRACK_TOKEN, 500,
+    );
+    sprintTicketIds = sprintTickets.map(t => t.id);
+  }
+
+  // Fuzzy match: find the most likely correct ticket from the sprint
+  function findCorrection(wrongId: string): string[] | undefined {
+    if (!sprintTicketIds.length) return undefined;
+    const [prefix, numStr] = wrongId.split('-');
+    if (!numStr) return undefined;
+
+    const matches: { id: string; score: number }[] = [];
+
+    for (const candidate of sprintTicketIds) {
+      const [cPrefix, cNum] = candidate.split('-');
+      if (!cNum || cPrefix !== prefix) continue;
+      if (candidate === wrongId) continue; // skip self
+
+      // Score the match
+      let score = 0;
+
+      // 1. Missing digit: "365" is prefix of "3656" → dev forgot a digit
+      if (cNum.startsWith(numStr) && cNum.length === numStr.length + 1) score += 10;
+
+      // 2. Extra digit: "36566" → "3656" → dev added an extra digit
+      if (numStr.startsWith(cNum) && numStr.length === cNum.length + 1) score += 9;
+
+      // 3. Transposed digits: "3665" vs "3656"
+      if (numStr.length === cNum.length) {
+        let diffs = 0;
+        for (let i = 0; i < numStr.length; i++) {
+          if (numStr[i] !== cNum[i]) diffs++;
+        }
+        if (diffs === 1) score += 8; // single digit off
+        if (diffs === 2 && numStr.length >= 3) {
+          // Check if it's a transposition
+          for (let i = 0; i < numStr.length - 1; i++) {
+            if (numStr[i] === cNum[i + 1] && numStr[i + 1] === cNum[i]) {
+              score += 7;
+              break;
+            }
+          }
+        }
+      }
+
+      // 4. Prefix overlap (weaker signal)
+      if (score === 0) {
+        let common = 0;
+        for (let i = 0; i < Math.min(numStr.length, cNum.length); i++) {
+          if (numStr[i] === cNum[i]) common++;
+          else break;
+        }
+        if (common >= 2 && Math.abs(numStr.length - cNum.length) <= 1) score += common;
+      }
+
+      if (score >= 3) {
+        matches.push({ id: candidate, score });
+      }
+    }
+
+    // Return all matches sorted by score descending, then by ticket number
+    matches.sort((a, b) => b.score - a.score || a.id.localeCompare(b.id));
+    return matches.length ? matches.map(m => m.id) : undefined;
+  }
+
+  function detectSuspicious(tid: string, yt: { state?: string; sprints?: string[]; updated?: number } | undefined): { reason: string; suggestion?: string } | undefined {
+    if (!yt) {
+      const suggestions = findCorrection(tid);
+      const suggestion = suggestions ? suggestions.join(', ') : undefined;
+      return { reason: 'Ticket not found on YouTrack', suggestion };
+    }
     const reasons: string[] = [];
+    let likelyWrongNumber = false;
+
+    // Dead states — ticket was closed as junk, almost certainly a wrong number
+    const DEAD_STATES = new Set(['Duplicate', "Won't Fix", 'Cancelled', 'Rejected', 'Obsolete']);
 
     // State check: ticket not in a healthy release state
     if (yt.state && !HEALTHY_STATES.has(yt.state)) {
       reasons.push(`State is "${yt.state}"`);
+      if (DEAD_STATES.has(yt.state)) likelyWrongNumber = true;
     }
 
     // Date check: if ticket was last updated 3+ months before the release was created
@@ -458,18 +531,24 @@ releasesCtrl.post('/:id/generate', async (c) => {
       if (gap > GAP_MS) {
         const months = Math.round(gap / (30 * 24 * 60 * 60 * 1000));
         reasons.push(`Last updated ${months} months before this release`);
+        likelyWrongNumber = true;
       }
     }
 
-    // Sprint check: ticket not in current or previous sprint
+    // Sprint check: ticket not in current sprint
     if (recentSprintNames.size > 0 && yt.sprints && yt.sprints.length > 0) {
       const inRecentSprint = yt.sprints.some(s => recentSprintNames.has(s));
       if (!inRecentSprint) {
-        reasons.push(`In sprint "${yt.sprints[yt.sprints.length - 1]}", not current`);
+        reasons.push(`Not in current sprint`);
       }
     }
 
-    return reasons.length ? reasons.join(' · ') : undefined;
+    if (!reasons.length) return undefined;
+
+    // Only suggest corrections for tickets that are likely wrong numbers
+    const suggestions = likelyWrongNumber ? findCorrection(tid) : undefined;
+    const suggestion = suggestions ? suggestions.join(', ') : undefined;
+    return { reason: reasons.join(' · '), suggestion };
   }
 
   let totalTickets = 0;
@@ -478,7 +557,12 @@ releasesCtrl.post('/:id/generate', async (c) => {
       const yt = ticketMap.get(tid);
       const excluded = excludedPatterns.some(p => tid.includes(p));
       const priority = yt?.priority ?? '';
-      const suspicious = detectSuspicious(tid, yt);
+      const result = detectSuspicious(tid, yt);
+      const suspicious = result
+        ? result.suggestion
+          ? `${result.reason} · Did you mean ${result.suggestion}?`
+          : result.reason
+        : undefined;
       return {
         id: tid,
         title: yt?.summary ?? tid,
@@ -604,6 +688,68 @@ releasesCtrl.put('/:id/document', async (c) => {
   return c.json({ success: true });
 });
 
+// ─── Remap a suspicious ticket to a corrected ID ────────────────────────────
+releasesCtrl.post('/:id/remap-ticket', async (c) => {
+  const releaseId = c.req.param('id');
+  const { oldId, newId } = await c.req.json<{ oldId: string; newId: string }>();
+  if (!oldId || !newId) return c.json({ error: 'oldId and newId required' }, 400);
+
+  const db = drizzle(c.env.DB);
+  const row = await db.select().from(releaseDocuments).where(eq(releaseDocuments.release_id, releaseId)).limit(1);
+  if (!row[0]) return c.json({ error: 'No document found' }, 404);
+
+  const doc = JSON.parse(row[0].content);
+
+  // Check if newId already exists in the document
+  for (const repo of doc.repos) {
+    if (repo.tickets.some((t: any) => t.id === newId)) {
+      return c.json({ error: `${newId} already exists in document` }, 409);
+    }
+  }
+
+  // Find the old ticket
+  let found = false;
+  for (const repo of doc.repos) {
+    const idx = repo.tickets.findIndex((t: any) => t.id === oldId);
+    if (idx === -1) continue;
+
+    const old = repo.tickets[idx];
+
+    // Enrich from YouTrack
+    const yt = await getTicket(newId, c.env.YOUTRACK_BASE_URL, c.env.YOUTRACK_TOKEN);
+    const enriched = yt.ok ? yt.data : null;
+
+    const replacement = {
+      id: newId,
+      title: enriched?.summary ?? newId,
+      assignee: enriched?.assignee ?? '',
+      priority: enriched?.priority ?? '',
+      risk: old.risk ?? '',
+      notes: old.notes ?? '',
+      excluded: old.excluded ?? false,
+      suspicious: undefined,
+    };
+
+    repo.tickets[idx] = replacement;
+
+    // Also update the ticketIds array if it exists
+    if (repo.ticketIds) {
+      const tidIdx = repo.ticketIds.indexOf(oldId);
+      if (tidIdx !== -1) repo.ticketIds[tidIdx] = newId;
+    }
+
+    found = true;
+
+    await db.update(releaseDocuments)
+      .set({ content: JSON.stringify(doc), updated_at: new Date().toISOString() })
+      .where(eq(releaseDocuments.release_id, releaseId));
+
+    return c.json({ success: true, ticket: replacement });
+  }
+
+  if (!found) return c.json({ error: 'Ticket not found in document' }, 404);
+});
+
 // ─── Staging pipeline: commits on stage not yet on main ───────────────────────
 // Hybrid approach:
 // 1. Pattern matching catches obvious cases (backmerges, hotfix merges, release merges) — zero API cost
@@ -723,6 +869,46 @@ releasesCtrl.post('/:id/create-mrs', async (c) => {
   });
 
   return c.json({ branch: release.branch_name, results });
+});
+
+// ─── Create merge requests: main → stage (backmerge) ───────────────────────────
+releasesCtrl.post('/:id/create-backmerge-mrs', async (c) => {
+  const releaseId = c.req.param('id');
+  const db = drizzle(c.env.DB);
+
+  const [release] = await db.select().from(releases).where(eq(releases.id, releaseId)).limit(1);
+  if (!release) return c.json({ error: 'Not found' }, 404);
+
+  const rows = await db
+    .select({ rr: releaseRepos, repo: repositories })
+    .from(releaseRepos)
+    .innerJoin(repositories, eq(releaseRepos.repo_id, repositories.id))
+    .where(eq(releaseRepos.release_id, releaseId));
+
+  const mrTitle = `Backmerge: Merge main into stage`;
+
+  const results = await batchSequential(rows, 3, 300, async ({ repo }) => {
+    if (!repo.project_id) return { repo: repo.name, result: 'skipped', error: 'no project_id' };
+    try {
+      const mr = await createMergeRequest(
+        repo.project_id,
+        'main',
+        'stage',
+        mrTitle,
+        c.env.GITLAB_TOKEN
+      );
+      return {
+        repo: repo.name,
+        result: mr.created ? 'created' : (mr.error ?? 'already exists'),
+        url: mr.url ?? null,
+        iid: mr.iid ?? null,
+      };
+    } catch (e) {
+      return { repo: repo.name, result: 'error', error: String(e) };
+    }
+  });
+
+  return c.json({ branch: 'main', results });
 });
 
 // ─── Hotfixes: MRs merged to main ────────────────────────────────────────────
