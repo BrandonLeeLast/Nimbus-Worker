@@ -293,6 +293,9 @@ releasesCtrl.post('/:id/generate', async (c) => {
   const excludedPatterns = [...new Set([...globalExcluded, ...extraExcluded])];
 
   const allTicketIds = new Set<string>();
+  // Maps ticket ID → GitLab MR author name (the dev who created the branch)
+  const ticketDevMap = new Map<string, string>();
+
   const repoData: {
     repoId: string;
     name: string;
@@ -303,7 +306,7 @@ releasesCtrl.post('/:id/generate', async (c) => {
     notes: string;
     commits: { id: string; short_id: string; title: string; author_name: string; created_at: string; web_url: string }[];
     ticketIds: string[];
-    tickets: { id: string; title: string; assignee: string; priority: string; risk: string; notes: string; excluded: boolean }[];
+    tickets: { id: string; title: string; assignee: string; priority: string; risk: string; notes: string; excluded: boolean; dev?: string; withTester?: boolean }[];
     sections: { title: string; body: string }[];
     error?: string;
   }[] = [];
@@ -322,10 +325,13 @@ releasesCtrl.post('/:id/generate', async (c) => {
     }
 
     try {
-      // Compare main → release branch to find what's in this release
-      const [compare, mergedMRs] = await Promise.all([
+      // Compare main → release branch to find what's in this release.
+      // Also fetch MRs merged into stage — these are the feature branches devs actually work on,
+      // and their authors give us the dev name for tester detection.
+      const [compare, mergedMRs, stageMRs] = await Promise.all([
         compareRefs(repo.project_id, 'main', release.branch_name, c.env.GITLAB_TOKEN),
         getMergedMRs(repo.project_id, release.branch_name, c.env.GITLAB_TOKEN),
+        getMergedMRs(repo.project_id, 'stage', c.env.GITLAB_TOKEN),
       ]);
       const allCommits = compare.commits ?? [];
 
@@ -355,20 +361,47 @@ releasesCtrl.post('/:id/generate', async (c) => {
       // 1. Extract ticket IDs only from commits that are genuinely part of this release
       //    (i.e. not already on main). Commits flagged as onMain were deployed via hotfix
       //    or backmerge and should NOT appear in the release document.
+      //    Also record commit author as the dev for tester detection.
       for (const commit of mapped) {
         if (!commit.onMain) {
-          extractTicketIds(commit.title).forEach(t => ticketIds.push(t));
+          extractTicketIds(commit.title).forEach(t => {
+            ticketIds.push(t);
+            if (!ticketDevMap.has(t) && commit.author_name) ticketDevMap.set(t, commit.author_name);
+          });
         }
       }
 
       // 2. Extract from MR source branch names + titles merged into this release branch.
       //    Catches commits with no ticket ID in title but on a branch like Michalis/INDEV-3833_...
       //    Skip hotfix branches — those were deployed directly to main, not via this release.
+      //    Also record the MR author as the dev for each ticket (used for tester detection).
       const HOTFIX_BRANCH_RE = /^hotfix\//i;
       for (const mr of mergedMRs) {
         if (!HOTFIX_BRANCH_RE.test(mr.source_branch)) {
-          extractTicketIds(mr.source_branch).forEach(t => ticketIds.push(t));
-          extractTicketIds(mr.title).forEach(t => ticketIds.push(t));
+          const mrTickets = [
+            ...extractTicketIds(mr.source_branch),
+            ...extractTicketIds(mr.title),
+          ];
+          mrTickets.forEach(t => {
+            ticketIds.push(t);
+            if (!ticketDevMap.has(t)) ticketDevMap.set(t, mr.author.name);
+          });
+        }
+      }
+
+      // 3. Mine stage MRs for ticket → dev mapping.
+      //    Feature branches typically target stage, not the release branch directly,
+      //    so this is the most reliable source of who actually wrote the code.
+      for (const mr of stageMRs) {
+        if (!HOTFIX_BRANCH_RE.test(mr.source_branch)) {
+          const mrTickets = [
+            ...extractTicketIds(mr.source_branch),
+            ...extractTicketIds(mr.title),
+          ];
+          mrTickets.forEach(t => {
+            // Don't push to ticketIds — only use for dev attribution
+            if (!ticketDevMap.has(t)) ticketDevMap.set(t, mr.author.name);
+          });
         }
       }
 
@@ -423,6 +456,18 @@ releasesCtrl.post('/:id/generate', async (c) => {
     repo.ticketIds = repo.ticketIds.map(normalizeTicketId);
   }
 
+  // Normalize ticketDevMap keys to match normalized ticket IDs
+  for (const [id, dev] of [...ticketDevMap.entries()]) {
+    const normalized = normalizeTicketId(id);
+    if (normalized !== id) { ticketDevMap.set(normalized, dev); ticketDevMap.delete(id); }
+  }
+
+  // Load testers — assignees in this set are QA, so we show the MR author (dev) instead
+  const testersSetting = await db.select().from(systemSettings).where(eq(systemSettings.key, 'TESTERS')).limit(1);
+  const testerNames = new Set(
+    (testersSetting[0]?.value ?? '').split(',').map((s: string) => s.trim().toLowerCase()).filter(Boolean)
+  );
+
   // Enrich with YouTrack
   const ticketMap = await getTickets([...normalizedAllTicketIds], c.env.YOUTRACK_BASE_URL, c.env.YOUTRACK_TOKEN);
 
@@ -440,12 +485,10 @@ releasesCtrl.post('/:id/generate', async (c) => {
   // States considered healthy for a release — anything else gets flagged
   const HEALTHY_STATES = new Set([
     'Stage Approved', 'Stage Testing', 'Staging',
-    'Closed', 'Done', 'Verified', 'Deployed',
   ]);
 
-  // States that mean the ticket is already live — flag as suspicious since
-  // it shouldn't be appearing in a new release if it's already in production
-  const ALREADY_DEPLOYED_STATES = new Set(['Production', 'Production Testing']);
+  // States that mean the ticket is already live/done — filter from doc entirely
+  const ALREADY_DEPLOYED_STATES = new Set(['Production', 'Production Testing', 'Closed', 'Done', 'Verified', 'Deployed']);
 
   // Fetch all tickets in the current sprint for smart correction
   let sprintTicketIds: string[] = [];
@@ -585,15 +628,19 @@ releasesCtrl.post('/:id/generate', async (c) => {
             ? `${result.reason} · Did you mean ${result.suggestion}?`
             : result.reason
           : undefined;
+        const assignee = yt?.assignee ?? '';
+        const isTester = assignee && testerNames.has(assignee.toLowerCase());
+        const dev = isTester ? (ticketDevMap.get(tid) ?? '') : '';
         return {
           id: tid,
           title: yt?.summary ?? tid,
-          assignee: yt?.assignee ?? '',
+          assignee,
           priority,
           risk: '',
           notes: '',
           excluded,
           suspicious,
+          ...(isTester && { dev, withTester: true }),
         };
       });
     totalTickets += repo.tickets.filter(t => !t.excluded).length;
@@ -662,7 +709,8 @@ releasesCtrl.post('/:id/generate', async (c) => {
         path: r.path,
         commitCount: r.commitCount,
         ticketCount: r.tickets.filter(t => !t.excluded).length,
-        deployStatus: existingRepo?.deployStatus ?? r.deployStatus,
+        // Auto no-deploy if nothing found — unless user already explicitly set it
+        deployStatus: existingRepo?.deployStatus ?? (r.commitCount === 0 && r.tickets.length === 0 ? 'no-deploy' : r.deployStatus),
         riskLevel: existingRepo?.riskLevel ?? r.riskLevel,
         notes: existingRepo?.notes ?? r.notes,
         sections: existingRepo?.sections ?? r.sections,

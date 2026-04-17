@@ -48,6 +48,27 @@ settingsCtrl.post('/clear-cache', async (c) => {
   return c.json({ success: true, cleared: keys.length });
 });
 
+// Search YouTrack users by name — for tester autocomplete
+settingsCtrl.get('/youtrack-users', async (c) => {
+  const q = c.req.query('q') ?? '';
+  if (q.length < 2) return c.json([]);
+
+  const cacheKey = `yt_users:${q.toLowerCase()}`;
+  const cached = await c.env.NIMBUS_KV.get(cacheKey, 'json');
+  if (cached) return c.json(cached);
+
+  const res = await fetch(
+    `${c.env.YOUTRACK_BASE_URL}/api/users?query=${encodeURIComponent(q)}&fields=id,fullName,login&$top=20`,
+    { headers: { Authorization: `Bearer ${c.env.YOUTRACK_TOKEN}`, Accept: 'application/json' } }
+  );
+  if (!res.ok) return c.json([]);
+
+  const users = await res.json() as { id: string; fullName: string; login: string }[];
+  const result = users.map(u => ({ id: u.id, name: u.fullName ?? u.login, login: u.login }));
+  await c.env.NIMBUS_KV.put(cacheKey, JSON.stringify(result), { expirationTtl: 3600 });
+  return c.json(result);
+});
+
 // Set a setting
 settingsCtrl.put('/:key', async (c) => {
   const key = c.req.param('key');
