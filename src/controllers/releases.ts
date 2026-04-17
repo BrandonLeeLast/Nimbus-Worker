@@ -696,6 +696,7 @@ releasesCtrl.post('/:id/generate', async (c) => {
     signOff: existing.signOff ?? { releaseLead: '', technicalLead: '', qaLead: '' },
     highlights: existing.highlights ?? [],
     overview: existing.overview ?? '',
+    docStatus: existing.docStatus ?? 'draft',
     // Always regenerated from GitLab
     release: { name: release.name, date: releaseDate, branch: release.branch_name },
     summary: { totalCommits, totalTickets, reposModified, reposTotal: repoData.length },
