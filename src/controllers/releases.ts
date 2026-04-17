@@ -352,17 +352,24 @@ releasesCtrl.post('/:id/generate', async (c) => {
 
       const ticketIds: string[] = [];
 
-      // 1. Extract ticket IDs from ALL commits (including hotfix merges, backmerges)
-      //    so hotfixes merged into release branch still get their tickets picked up.
-      for (const commit of allCommits) {
-        extractTicketIds(commit.title).forEach(t => ticketIds.push(t));
+      // 1. Extract ticket IDs only from commits that are genuinely part of this release
+      //    (i.e. not already on main). Commits flagged as onMain were deployed via hotfix
+      //    or backmerge and should NOT appear in the release document.
+      for (const commit of mapped) {
+        if (!commit.onMain) {
+          extractTicketIds(commit.title).forEach(t => ticketIds.push(t));
+        }
       }
 
       // 2. Extract from MR source branch names + titles merged into this release branch.
       //    Catches commits with no ticket ID in title but on a branch like Michalis/INDEV-3833_...
+      //    Skip hotfix branches — those were deployed directly to main, not via this release.
+      const HOTFIX_BRANCH_RE = /^hotfix\//i;
       for (const mr of mergedMRs) {
-        extractTicketIds(mr.source_branch).forEach(t => ticketIds.push(t));
-        extractTicketIds(mr.title).forEach(t => ticketIds.push(t));
+        if (!HOTFIX_BRANCH_RE.test(mr.source_branch)) {
+          extractTicketIds(mr.source_branch).forEach(t => ticketIds.push(t));
+          extractTicketIds(mr.title).forEach(t => ticketIds.push(t));
+        }
       }
 
       // Filter merge commits from the visible list only (display/count)
@@ -433,9 +440,12 @@ releasesCtrl.post('/:id/generate', async (c) => {
   // States considered healthy for a release — anything else gets flagged
   const HEALTHY_STATES = new Set([
     'Stage Approved', 'Stage Testing', 'Staging',
-    'Production Testing', 'Production', 'Closed',
-    'Done', 'Verified', 'Deployed',
+    'Closed', 'Done', 'Verified', 'Deployed',
   ]);
+
+  // States that mean the ticket is already live — flag as suspicious since
+  // it shouldn't be appearing in a new release if it's already in production
+  const ALREADY_DEPLOYED_STATES = new Set(['Production', 'Production Testing']);
 
   // Fetch all tickets in the current sprint for smart correction
   let sprintTicketIds: string[] = [];
@@ -519,8 +529,13 @@ releasesCtrl.post('/:id/generate', async (c) => {
     // Dead states — ticket was closed as junk, almost certainly a wrong number
     const DEAD_STATES = new Set(['Duplicate', "Won't Fix", 'Cancelled', 'Rejected', 'Obsolete']);
 
+    // State check: ticket already in production — was deployed in a previous release
+    if (yt.state && ALREADY_DEPLOYED_STATES.has(yt.state)) {
+      reasons.push(`Already deployed (state is "${yt.state}")`);
+    }
+
     // State check: ticket not in a healthy release state
-    if (yt.state && !HEALTHY_STATES.has(yt.state)) {
+    if (yt.state && !HEALTHY_STATES.has(yt.state) && !ALREADY_DEPLOYED_STATES.has(yt.state)) {
       reasons.push(`State is "${yt.state}"`);
       if (DEAD_STATES.has(yt.state)) likelyWrongNumber = true;
     }
@@ -553,27 +568,34 @@ releasesCtrl.post('/:id/generate', async (c) => {
 
   let totalTickets = 0;
   for (const repo of repoData) {
-    repo.tickets = repo.ticketIds.map(tid => {
-      const yt = ticketMap.get(tid);
-      const excluded = excludedPatterns.some(p => tid.includes(p));
-      const priority = yt?.priority ?? '';
-      const result = detectSuspicious(tid, yt);
-      const suspicious = result
-        ? result.suggestion
-          ? `${result.reason} · Did you mean ${result.suggestion}?`
-          : result.reason
-        : undefined;
-      return {
-        id: tid,
-        title: yt?.summary ?? tid,
-        assignee: yt?.assignee ?? '',
-        priority,
-        risk: '',
-        notes: '',
-        excluded,
-        suspicious,
-      };
-    });
+    repo.tickets = repo.ticketIds
+      // Strip tickets already in production — they were deployed in a previous release
+      // and have no place in this release doc, recon, executive summary, or PDF.
+      .filter(tid => {
+        const yt = ticketMap.get(tid);
+        return !yt?.state || !ALREADY_DEPLOYED_STATES.has(yt.state);
+      })
+      .map(tid => {
+        const yt = ticketMap.get(tid);
+        const excluded = excludedPatterns.some(p => tid.includes(p));
+        const priority = yt?.priority ?? '';
+        const result = detectSuspicious(tid, yt);
+        const suspicious = result
+          ? result.suggestion
+            ? `${result.reason} · Did you mean ${result.suggestion}?`
+            : result.reason
+          : undefined;
+        return {
+          id: tid,
+          title: yt?.summary ?? tid,
+          assignee: yt?.assignee ?? '',
+          priority,
+          risk: '',
+          notes: '',
+          excluded,
+          suspicious,
+        };
+      });
     totalTickets += repo.tickets.filter(t => !t.excluded).length;
   }
 
