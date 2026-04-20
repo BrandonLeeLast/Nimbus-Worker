@@ -1054,9 +1054,14 @@ releasesCtrl.post('/:id/manual-ticket', async (c) => {
     doc.manualTickets = [];
   }
 
-  // Check if ticket already exists
+  // Check if ticket already exists in manual list
   if (doc.manualTickets.some((t: any) => t.id === id)) {
     return c.json({ error: 'Ticket already exists' }, 400);
+  }
+
+  // Prevent duplicates if this ticket is already present in generated repo tickets
+  if ((doc.repos ?? []).some((r: any) => (r.tickets ?? []).some((t: any) => t.id === id))) {
+    return c.json({ error: 'Ticket already exists in release document' }, 400);
   }
 
   // Add the manual ticket
@@ -1071,6 +1076,41 @@ releasesCtrl.post('/:id/manual-ticket', async (c) => {
   };
 
   doc.manualTickets.push(manualTicket);
+
+  // Also add it into repo tickets so it appears in Releases -> Changes by Project
+  if (!doc.repos) doc.repos = [];
+  const repoName = repo.trim();
+  const repoIdx = doc.repos.findIndex((r: any) => String(r.name ?? '').toLowerCase() === repoName.toLowerCase());
+  const docTicket = {
+    id,
+    title,
+    assignee: developer,
+    priority: '',
+    risk: '',
+    notes: description || '',
+    excluded: false,
+    manual: true,
+    linkedTicket: linkedTicket || undefined,
+  };
+
+  if (repoIdx >= 0) {
+    if (!doc.repos[repoIdx].tickets) doc.repos[repoIdx].tickets = [];
+    doc.repos[repoIdx].tickets.push(docTicket);
+    doc.repos[repoIdx].ticketCount = (doc.repos[repoIdx].tickets ?? []).filter((t: any) => !t.excluded).length;
+  } else {
+    doc.repos.push({
+      repoId: `manual-${crypto.randomUUID()}`,
+      name: repoName,
+      path: '',
+      commitCount: 0,
+      ticketCount: 1,
+      deployStatus: 'deploy',
+      riskLevel: 'low',
+      notes: 'Contains manually added cards',
+      sections: [],
+      tickets: [docTicket],
+    });
+  }
 
   // Save updated document
   await db.update(releaseDocuments)
