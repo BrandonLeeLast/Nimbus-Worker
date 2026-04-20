@@ -1023,6 +1023,69 @@ releasesCtrl.get('/:id/hotfixes', async (c) => {
   return c.json(results);
 });
 
+// ─── Add manual ticket ────────────────────────────────────────────────────────
+releasesCtrl.post('/:id/manual-ticket', async (c) => {
+  const releaseId = c.req.param('id');
+  const { id, title, developer, repo, description, linkedTicket } = await c.req.json<{
+    id: string;
+    title: string;
+    developer: string;
+    repo: string;
+    description?: string;
+    linkedTicket?: string;
+  }>();
+
+  if (!id || !title || !developer || !repo) {
+    return c.json({ error: 'id, title, developer, and repo are required' }, 400);
+  }
+
+  const db = drizzle(c.env.DB);
+
+  // Get current document
+  const [docRow] = await db.select().from(releaseDocuments).where(eq(releaseDocuments.release_id, releaseId)).limit(1);
+  if (!docRow) {
+    return c.json({ error: 'Release document not found' }, 404);
+  }
+
+  const doc = JSON.parse(docRow.content) as any;
+  
+  // Initialize manualTickets if it doesn't exist
+  if (!doc.manualTickets) {
+    doc.manualTickets = [];
+  }
+
+  // Check if ticket already exists
+  if (doc.manualTickets.some((t: any) => t.id === id)) {
+    return c.json({ error: 'Ticket already exists' }, 400);
+  }
+
+  // Add the manual ticket
+  const manualTicket = {
+    id,
+    title,
+    developer,
+    repo,
+    description: description || '',
+    linkedTicket: linkedTicket || undefined,
+    addedAt: new Date().toISOString(),
+  };
+
+  doc.manualTickets.push(manualTicket);
+
+  // Save updated document
+  await db.update(releaseDocuments)
+    .set({
+      content: JSON.stringify(doc),
+      updated_at: new Date().toISOString(),
+    })
+    .where(eq(releaseDocuments.release_id, releaseId));
+
+  // Clear recon cache
+  await c.env.NIMBUS_KV.delete(`recon:${releaseId}:`);
+  
+  return c.json({ success: true, ticket: manualTicket });
+});
+
 // ─── Recon ────────────────────────────────────────────────────────────────────
 // Cross-references tickets found in release commits against YouTrack board state.
 // Returns:
@@ -1043,6 +1106,7 @@ releasesCtrl.get('/:id/recon', async (c) => {
 
   const doc = JSON.parse(docRow.content) as {
     repos: { name: string; path: string; tickets: { id: string; title: string; assignee: string; excluded: boolean }[] }[];
+    manualTickets?: { id: string; title: string; developer: string; repo: string; description?: string; linkedTicket?: string; addedAt: string }[];
   };
 
   // Build map of ticketId -> repos it appears in
@@ -1054,6 +1118,16 @@ releasesCtrl.get('/:id/recon', async (c) => {
     }
   }
 
+  // Add manual tickets to the map
+  if (doc.manualTickets) {
+    for (const mt of doc.manualTickets) {
+      if (!ticketRepoMap.has(mt.id)) ticketRepoMap.set(mt.id, []);
+      if (!ticketRepoMap.get(mt.id)!.includes(mt.repo)) {
+        ticketRepoMap.get(mt.id)!.push(mt.repo);
+      }
+    }
+  }
+
   const releaseTicketIds = [...ticketRepoMap.keys()];
 
   // Fetch fresh current state for all release tickets from YouTrack
@@ -1062,10 +1136,11 @@ releasesCtrl.get('/:id/recon', async (c) => {
   const releaseTickets = releaseTicketIds.map(id => {
     const yt = ytMap.get(id);
     const repoTicket = doc.repos.flatMap(r => r.tickets).find(t => t.id === id);
+    const manualTicket = doc.manualTickets?.find(t => t.id === id);
     return {
       id,
-      title: yt?.summary ?? repoTicket?.title ?? id,
-      assignee: yt?.assignee ?? repoTicket?.assignee ?? '',
+      title: yt?.summary ?? manualTicket?.title ?? repoTicket?.title ?? id,
+      assignee: yt?.assignee ?? manualTicket?.developer ?? repoTicket?.assignee ?? '',
       state: yt?.state ?? 'Unknown',
       priority: yt?.priority ?? '',
       repos: ticketRepoMap.get(id) ?? [],
