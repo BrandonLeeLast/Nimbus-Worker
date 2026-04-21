@@ -10,6 +10,15 @@ export interface YouTrackTicket {
   resolved?: number;   // epoch ms
 }
 
+function hasYouTrackConfig(baseUrl: string | undefined, token: string | undefined): baseUrl is string {
+  if (!baseUrl || !token) return false;
+  return /^https?:\/\//i.test(baseUrl);
+}
+
+function trimTrailingSlash(url: string): string {
+  return url.replace(/\/+$/, '');
+}
+
 type YouTrackResult =
   | { ok: true; data: YouTrackTicket }
   | { ok: false; status: number; error: string };
@@ -19,9 +28,13 @@ export async function getTicket(
   baseUrl: string,
   token: string
 ): Promise<YouTrackResult> {
+  if (!hasYouTrackConfig(baseUrl, token)) {
+    return { ok: false, status: 0, error: 'YouTrack not configured' };
+  }
   try {
+    const safeBase = trimTrailingSlash(baseUrl);
     const res = await fetch(
-      `${baseUrl}/api/issues/${encodeURIComponent(ticketId)}?fields=id,summary,description,updated,resolved,customFields(name,value(name,login,fullName),values(name))`,
+      `${safeBase}/api/issues/${encodeURIComponent(ticketId)}?fields=id,summary,description,updated,resolved,customFields(name,value(name,login,fullName),values(name))`,
       {
         headers: {
           Authorization: `Bearer ${token}`,
@@ -96,9 +109,17 @@ export interface YouTrackSprint {
 }
 
 export async function getSprints(baseUrl: string, token: string): Promise<YouTrackSprint[]> {
-  const res = await fetch(`${baseUrl}/api/agiles?fields=id,name,sprints(id,name,start,finish,archived)&$top=50`, {
-    headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-  });
+  if (!hasYouTrackConfig(baseUrl, token)) return [];
+
+  let res: Response;
+  try {
+    const safeBase = trimTrailingSlash(baseUrl);
+    res = await fetch(`${safeBase}/api/agiles?fields=id,name,sprints(id,name,start,finish,archived)&$top=50`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+    });
+  } catch {
+    return [];
+  }
   if (!res.ok) return [];
 
   const boards = await res.json() as {
@@ -136,15 +157,23 @@ export async function getTicketsByQuery(
   token: string,
   maxTickets = 500,
 ): Promise<YouTrackTicket[]> {
+  if (!hasYouTrackConfig(baseUrl, token)) return [];
+
   const fields = 'id,idReadable,summary,customFields(name,value(name,login,fullName))';
   const perPage = 100;
   const results: YouTrackTicket[] = [];
+  const safeBase = trimTrailingSlash(baseUrl);
 
   for (let skip = 0; skip < maxTickets; skip += perPage) {
-    const url = `${baseUrl}/api/issues?query=${encodeURIComponent(query)}&fields=${fields}&$top=${perPage}&$skip=${skip}`;
-    const res = await fetch(url, {
-      headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
-    });
+    const url = `${safeBase}/api/issues?query=${encodeURIComponent(query)}&fields=${fields}&$top=${perPage}&$skip=${skip}`;
+    let res: Response;
+    try {
+      res = await fetch(url, {
+        headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' },
+      });
+    } catch {
+      break;
+    }
     if (!res.ok) break;
     const batch = await res.json() as {
       id: string;

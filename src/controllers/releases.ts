@@ -1570,7 +1570,7 @@ releasesCtrl.get('/:id/executive/overview-preview', async (c) => {
         </div>
         <div class="info-item">
           <div class="info-label">Overall Risk Level</div>
-          <div class="info-value risk-${(doc.overallRisk ?? 'low').toLowerCase()}">${doc.overallRisk ?? 'Low'}</div>
+          <div class="info-value risk-${String(doc.overallRisk ?? 'low').toLowerCase()}">${doc.overallRisk ?? 'Low'}</div>
         </div>
       </div>
     </div>
